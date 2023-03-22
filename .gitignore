@@ -1,0 +1,15 @@
+.git
+.env
+.DS_Store # macOS specific ignore
+airflow_settings.yaml
+__pycache__/
+astro
+include/weaviate/data
+include/minio/data
+include/great_expectations/uncommitted/
+include/dbt/attribution_playbook/target/*
+include/dbt/attribution_playbook/logs/*
+include/dbt/jaffle_shop/logs/*
+include/dbt/jaffle_shop/target/*
+include/dbt/mrr_playbook/logs/*
+include/dbt/mrr_playbook/target/*

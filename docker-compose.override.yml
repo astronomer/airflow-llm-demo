@@ -1,0 +1,89 @@
+version: '3.1'
+services:
+  # scheduler:
+  #   extra_hosts:
+  #     - 'host.docker.internal:host-gateway'
+  minio:
+    image: quay.io/minio/minio
+    command:
+    - server 
+    - /data 
+    - --console-address 
+    - ":9001"
+    ports:
+    - 9000:9000
+    - 9001:9001
+    volumes:
+    - ${PWD}/include/minio/data:/data
+    extra_hosts:
+    - "host.docker.internal:host-gateway"
+  mlflow:
+    image: ghcr.io/mlflow/mlflow
+    command:
+    - bash 
+    - -c
+    - '(pip install -q boto3) && (mlflow server --host 0.0.0.0 --backend-store-uri sqlite:////data/mlflow_backend.db --default-artifact-root s3://mlflow-data)'
+    ports:
+    - 5000:5000
+    env_file: .env
+    volumes:
+    - ${PWD}/include/mlflow/data:/data
+    extra_hosts:
+    - 'host.docker.internal:host-gateway'
+  weaviate:
+    image: semitechnologies/weaviate:1.17.3
+    command: "--host 0.0.0.0 --port '8081' --scheme http"
+    ports:
+    - 8081:8081
+    volumes:
+      - ${PWD}/include/weaviate/data:/var/lib/weaviate
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      DEFAULT_VECTORIZER_MODULE: 'text2vec-openai'
+      ENABLE_MODULES: 'text2vec-openai, backup-s3, ner-transformers, qna-openai'
+      NER_INFERENCE_API: 'http://host.docker.internal:8082'
+      CLUSTER_HOSTNAME: 'node1'
+      BACKUP_S3_BUCKET: 'weaviate-backup'
+      BACKUP_S3_ENDPOINT: 'host.docker.internal:9000'
+      BACKUP_S3_USE_SSL: 'false'
+    env_file: .env
+    extra_hosts:
+    - 'host.docker.internal:host-gateway'
+  ner-transformers:
+    image: semitechnologies/ner-transformers:dbmdz-bert-large-cased-finetuned-conll03-english
+    command: 
+    - "uvicorn app:app --host 0.0.0.0 --port 8082"
+    ports:
+    - 8082:8082      
+    environment:
+      ENABLE_CUDA: '0'
+    extra_hosts:
+    - 'host.docker.internal:host-gateway'
+  streamlit:
+    image: mpgregor/snowservices-streamlit:1.0.0
+    command:
+    - /home/astro/.venv/snowpark/bin/python
+    - -m
+    - streamlit
+    - run 
+    - streamlit_app.py 
+    - --server.port=8501 
+    - --server.address=0.0.0.0
+    env_file: .env
+    volumes:
+    - ${PWD}/include/streamlit/src:/app
+    ports:
+    - 8501:8501
+    extra_hosts:
+    - 'host.docker.internal:host-gateway'
+  local_db:
+    image: postgres
+    environment:
+      PGPORT: 5433
+    env_file: .env
+    ports:
+      - 5433:5433
+    extra_hosts:
+      - "host.docker.internal:host-gateway"      

@@ -1,0 +1,10 @@
+snowflake-snowpark-python[pandas]
+apache-airflow
+psycopg2-binary
+apache-airflow-providers-snowflake
+altair
+streamlit>=1.19.0
+weaviate-client
+seaborn
+matplotlib
+streamlit-aggrid

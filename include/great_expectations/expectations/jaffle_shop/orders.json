@@ -1,0 +1,63 @@
+{
+    "data_asset_type": null,
+    "expectation_suite_name": "jaffle_shop.orders",
+    "expectations": [
+      {
+        "expectation_context": {
+          "description": null
+        },
+        "expectation_type": "expect_table_row_count_to_be_between",
+        "ge_cloud_id": null,
+        "kwargs": {
+          "max_value": 110,
+          "min_value": 90
+        },
+        "meta": {}
+      },
+      {
+        "expectation_context": {
+          "description": null
+        },
+        "expectation_type": "expect_column_values_to_not_be_null",
+        "ge_cloud_id": null,
+        "kwargs": {
+          "column": "order_id"
+        },
+        "meta": {}
+      },
+      {
+        "expectation_context": {
+          "description": null
+        },
+        "expectation_type": "expect_column_values_to_not_be_null",
+        "ge_cloud_id": null,
+        "kwargs": {
+          "column": "customer_id"
+        },
+        "meta": {}
+      },
+      {
+        "expectation_context": {
+          "description": null
+        },
+        "expectation_type": "expect_column_distinct_values_to_be_in_set",
+        "ge_cloud_id": null,
+        "kwargs": {
+          "column": "status",
+          "value_set": [
+            "returned",
+            "completed",
+            "return_pending",
+            "shipped",
+            "placed"
+          ]
+        },
+        "meta": {}
+      }
+    ],
+    "ge_cloud_id": null,
+    "meta": {
+      "great_expectations_version": "0.15.47"
+    }
+  }
+  
