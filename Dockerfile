@@ -1,7 +1,7 @@
-# syntax=quay.io/astronomer/airflow-extensions:v1.0.0-alpha.3
+# syntax=quay.io/astronomer/airflow-extensions:latest
 
-FROM quay.io/astronomer/astro-runtime:7.4.1
+FROM quay.io/astronomer/astro-runtime:7.4.2-base
 
-PYENV 3.9 dbt requirements-dbt.txt
+COPY include/airflow_provider_great_expectations-0.2.6-py3-none-any.whl /tmp
 
-PYENV 3.8 snowpark requirements-snowpark.txt
+PYENV 3.8 dbt requirements-dbt.txt

@@ -1,3 +1,5 @@
 astronomer-cosmos>=0.4.1
-airflow-provider-great-expectations>=0.2.5
+# airflow-provider-great-expectations>=0.2.5
+/tmp/airflow_provider_great_expectations-0.2.6-py3-none-any.whl
 great-expectations==0.15.44
+weaviate-client==3.15.4

@@ -1,8 +1,5 @@
 version: '3.1'
 services:
-  # scheduler:
-  #   extra_hosts:
-  #     - 'host.docker.internal:host-gateway'
   minio:
     image: quay.io/minio/minio
     command:
@@ -62,15 +59,15 @@ services:
     extra_hosts:
     - 'host.docker.internal:host-gateway'
   streamlit:
-    image: mpgregor/snowservices-streamlit:1.0.0
-    command:
-    - /home/astro/.venv/snowpark/bin/python
-    - -m
-    - streamlit
-    - run 
-    - streamlit_app.py 
-    - --server.port=8501 
-    - --server.address=0.0.0.0
+    image: mpgregor/snowservices-streamlit:latest
+    # command:
+    # - /home/streamlit/.venv/snowpark/bin/python
+    # - -m
+    # - streamlit
+    # - run 
+    # - streamlit_app.py 
+    # - --server.port=8501 
+    # - --server.address=0.0.0.0
     env_file: .env
     volumes:
     - ${PWD}/include/streamlit/src:/app
@@ -79,7 +76,7 @@ services:
     extra_hosts:
     - 'host.docker.internal:host-gateway'
   local_db:
-    image: postgres
+    image: postgres:12.6
     environment:
       PGPORT: 5433
     env_file: .env

@@ -1,7 +1,8 @@
 version: 2
 sources:
   - name: stage
-    schema: "{{ env_var('SNOWFLAKE_SCHEMA') }}"
+    dbname: postgres
+    schema:  tmp_astro
     tables: 
       - name: stg_sessions
       - name: stg_customer_conversions

@@ -22,8 +22,3 @@ models:
     materialized: table
       # staging:
       #   materialized: view
-
-# profile: snowflake_conn
-
-# vars:
-#   source_schema_name: 'michaelgregory'
