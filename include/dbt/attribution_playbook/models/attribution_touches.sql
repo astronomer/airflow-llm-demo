@@ -1,12 +1,22 @@
 with sessions as (
 
-    select * from {{ source('stage', 'stg_sessions') }}
+    select session_id,
+           customer_id,
+           (started_at :: timestamp) as started_at,
+           (ended_at :: timestamp) as ended_at,
+           utm_source,
+           utm_medium,
+           utm_campaign
+        from {{ source('stage', 'stg_sessions') }}
 
 ),
 
 customer_conversions as (
 
-    select * from {{ source('stage', 'stg_customer_conversions') }}
+    select customer_id,
+           (converted_at :: timestamp) as converted_at, 
+           revenue 
+        from {{ source('stage', 'stg_customer_conversions') }}
 
 ),
 
@@ -29,8 +39,7 @@ sessions_before_conversion as (
     left join customer_conversions using (customer_id)
 
     where sessions.started_at <= customer_conversions.converted_at
-           and sessions.started_at >= dateadd(day, -30, customer_conversions.converted_at)
-
+           and sessions.started_at >= (customer_conversions.converted_at + interval '-30 day')
 ),
 
 with_points as (

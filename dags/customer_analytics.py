@@ -228,7 +228,10 @@ def customer_analytics():
                 dbt_project_name="jaffle_shop",
                 dbt_root_path="/usr/local/airflow/include/dbt",
                 conn_id=conn_id,
-                dbt_args={"dbt_executable_path": _DBT_BIN},
+                dbt_args={
+                    "dbt_executable_path": _DBT_BIN,
+                    "schema": "public",
+                },
                 test_behavior="after_all",
             )
             
@@ -236,14 +239,20 @@ def customer_analytics():
                 dbt_project_name="attribution_playbook",
                 dbt_root_path="/usr/local/airflow/include/dbt",
                 conn_id=conn_id,
-                dbt_args={"dbt_executable_path": _DBT_BIN},
+                dbt_args={
+                    "dbt_executable_path": _DBT_BIN,
+                    "schema": "public",
+                },
             )
 
             mrr_playbook = DbtTaskGroup(
                 dbt_project_name="mrr_playbook",
                 dbt_root_path="/usr/local/airflow/include/dbt",
                 conn_id=conn_id,
-                dbt_args={"dbt_executable_path": _DBT_BIN},
+                dbt_args={
+                    "dbt_executable_path": _DBT_BIN,
+                    "schema": "public",
+                },
             )
 
         extract_structured_data(raw_bucket_name=bucket_names['raw'], local_data_dir=local_data_dir) >> \
