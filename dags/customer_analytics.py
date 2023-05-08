@@ -3,6 +3,12 @@ import os
 from pathlib import Path
 import tempfile
 import requests
+import pandas as pd
+import numpy as np
+import whisper
+import weaviate
+from weaviate.util import generate_uuid5
+from time import sleep
 
 from astro import sql as aql 
 from astro.files import File 
@@ -19,7 +25,7 @@ _MINIO_CONN_ID = 'minio_default'
 restore_data_uri = 'https://astronomer-demos-public.s3.us-west-2.amazonaws.com/sissy-g-toys-demo/data'
 bucket_names = {'raw': 'raw-data', 'calls': 'customer-calls', 'weaviate': 'weaviate-backup'}
 local_data_dir = 'include/data'
-calls_directory_stage = 'call_stage'
+calls_file='include/data/customer_calls.csv'
 weaviate_endpoint_url = os.environ['WEAVIATE_ENDPOINT_URL']
 openai_apikey = os.environ['OPENAI_APIKEY']
 
@@ -36,6 +42,10 @@ def customer_analytics():
     
     @task_group()
     def enter():
+
+        @task()
+        def drop_schema(schema='tmp_astro'):
+            PostgresHook(_POSTGRES_CONN_ID).run(f'DROP SCHEMA IF EXISTS {schema} CASCADE;')
 
         @task()
         def create_minio_buckets(bucket_names:str) -> dict:
@@ -121,6 +131,8 @@ def customer_analytics():
             
             return weaviate_endpoint_url
 
+        drop_schema()
+        
         _bucket_names = create_minio_buckets(bucket_names)
 
         _weaviate_backup_bucket = _bucket_names['weaviate']
@@ -137,17 +149,15 @@ def customer_analytics():
             class_objects=weaviate_class_objects, 
             weaviate_endpoint_url=_weaviate_endpoint_url)
 
-        # _registry_name = check_model_registry(snowflake_conn_id=_SNOWFLAKE_CONN_ID, model_registry_database=model_registry_database)
-
-        return _bucket_names #, _registry_name, _weaviate_endpoint_url
+        return _bucket_names, _weaviate_endpoint_url
 
     @task_group()
-    def structured_data(bucket_names:dict, local_data_dir:str):
+    def structured_data(bucket_names:dict):
 
         @task_group()
-        def extract_structured_data(raw_bucket_name:str, local_data_dir:str):
+        def extract_structured_data(raw_bucket_name:str):
             @task()
-            def extract_SFDC_data(raw_bucket_name:str, local_data_dir:str):
+            def extract_SFDC_data(raw_bucket_name:str):
                 s3hook = S3Hook(_MINIO_CONN_ID)
                 for source in sfdc_sources:    
                     s3hook.load_file(
@@ -158,7 +168,7 @@ def customer_analytics():
                     )
             
             @task()
-            def extract_hubspot_data(raw_bucket_name:str, local_data_dir:str):
+            def extract_hubspot_data(raw_bucket_name:str):
                 s3hook = S3Hook(_MINIO_CONN_ID)
                 for source in hubspot_sources:    
                     s3hook.load_file(
@@ -169,7 +179,7 @@ def customer_analytics():
                     )
 
             @task()
-            def extract_segment_data(raw_bucket_name:str, local_data_dir:str):
+            def extract_segment_data(raw_bucket_name:str):
                 s3hook = S3Hook(_MINIO_CONN_ID)
                 for source in segment_sources:    
                     s3hook.load_file(
@@ -179,28 +189,31 @@ def customer_analytics():
                         replace=True,
                     )
             
-            [extract_SFDC_data(raw_bucket_name=raw_bucket_name, local_data_dir=local_data_dir), 
-             extract_hubspot_data(raw_bucket_name=raw_bucket_name, local_data_dir=local_data_dir), 
-             extract_segment_data(raw_bucket_name=raw_bucket_name, local_data_dir=local_data_dir)]
+            [extract_SFDC_data(raw_bucket_name=raw_bucket_name), 
+             extract_hubspot_data(raw_bucket_name=raw_bucket_name), 
+             extract_segment_data(raw_bucket_name=raw_bucket_name)]
 
         @task_group()
         def load_structured_data(raw_bucket_name:str):
             for source in sfdc_sources:
                 aql.load_file(task_id=f'load_{source}',
                     input_file = File(f"S3://{raw_bucket_name}/{source}.csv", conn_id=_MINIO_CONN_ID), 
-                    output_table = Table(name=f'STG_{source.upper()}', conn_id=_POSTGRES_CONN_ID)
+                    output_table = Table(name=f'STG_{source.upper()}', conn_id=_POSTGRES_CONN_ID),
+                    if_exists='append'
                 )
             
             for source in hubspot_sources:
                 aql.load_file(task_id=f'load_{source}',
                     input_file = File(f"S3://{raw_bucket_name}/{source}.csv", conn_id=_MINIO_CONN_ID), 
-                    output_table = Table(name=f'STG_{source.upper()}', conn_id=_POSTGRES_CONN_ID)
+                    output_table = Table(name=f'STG_{source.upper()}', conn_id=_POSTGRES_CONN_ID),
+                    if_exists='append'
                 )
             
             for source in segment_sources:
                 aql.load_file(task_id=f'load_{source}',
                     input_file = File(f"S3://{raw_bucket_name}/{source}.csv", conn_id=_MINIO_CONN_ID), 
-                    output_table = Table(name=f'STG_{source.upper()}', conn_id=_POSTGRES_CONN_ID)
+                    output_table = Table(name=f'STG_{source.upper()}', conn_id=_POSTGRES_CONN_ID),
+                    if_exists='append'
                 )
 
         @task_group()
@@ -223,14 +236,14 @@ def customer_analytics():
                     )
             
         @task_group()
-        def transform_structured(conn_id:str):
+        def transform_structured():
             jaffle_shop = DbtTaskGroup(
                 dbt_project_name="jaffle_shop",
                 dbt_root_path="/usr/local/airflow/include/dbt",
-                conn_id=conn_id,
+                conn_id=_POSTGRES_CONN_ID,
                 dbt_args={
                     "dbt_executable_path": _DBT_BIN,
-                    "schema": "public",
+                    "schema": "tmp_astro",
                 },
                 test_behavior="after_all",
             )
@@ -238,37 +251,38 @@ def customer_analytics():
             attribution_playbook = DbtTaskGroup(
                 dbt_project_name="attribution_playbook",
                 dbt_root_path="/usr/local/airflow/include/dbt",
-                conn_id=conn_id,
+                conn_id=_POSTGRES_CONN_ID,
                 dbt_args={
                     "dbt_executable_path": _DBT_BIN,
-                    "schema": "public",
+                    "schema": "tmp_astro",
                 },
             )
 
             mrr_playbook = DbtTaskGroup(
                 dbt_project_name="mrr_playbook",
                 dbt_root_path="/usr/local/airflow/include/dbt",
-                conn_id=conn_id,
+                conn_id=_POSTGRES_CONN_ID,
                 dbt_args={
                     "dbt_executable_path": _DBT_BIN,
-                    "schema": "public",
+                    "schema": "tmp_astro",
                 },
             )
 
-        extract_structured_data(raw_bucket_name=bucket_names['raw'], local_data_dir=local_data_dir) >> \
+        extract_structured_data(raw_bucket_name=bucket_names['raw']) >> \
             load_structured_data(raw_bucket_name=bucket_names['raw']) >> \
                 data_quality_checks() >> \
-                    transform_structured(conn_id=_POSTGRES_CONN_ID)
+                    transform_structured()
 
     @task_group()
-    def unstructured_data(bucket_names:dict, local_data_dir:str, calls_bucket_name:str, calls_directory_stage:str, weaviate_endpoint_url:str):
+    def unstructured_data(bucket_names:dict, weaviate_endpoint_url:str):
 
         @task_group()
-        def extract_unstructured_data(raw_bucket_name:str, local_data_dir:str, calls_bucket_name:str):
+        def extract_unstructured_data(raw_bucket_name:str, calls_bucket_name:str):
+            
             s3hook = S3Hook(_MINIO_CONN_ID)
 
             @task()
-            def extract_twitter(raw_bucket_name:str, local_data_dir:str):
+            def extract_twitter(raw_bucket_name:str):
                 for source in twitter_sources:
                     s3hook.load_file(
                         filename=f"{local_data_dir}/{source}.parquet", 
@@ -276,13 +290,15 @@ def customer_analytics():
                         bucket_name=raw_bucket_name,
                         replace=True,
                     )
-            
-            @task()
-            def extract_customer_support_calls(restore_data_uri:str, calls_bucket_name:str):   
-                
-                support_calls = Path('include/data/customer_calls.txt').read_text().split('\n')
+        
+            @aql.dataframe(conn_id=_POSTGRES_CONN_ID, database='postgres', schema='tmp_astro')
+            def extract_customer_support_calls(calls_bucket_name:str, output_table=Table(name='STG_CUSTOMER_CALLS')):
 
-                for file in support_calls:
+                calls_df = pd.read_csv(calls_file)
+                calls_df['CUSTOMER_ID'] = calls_df['RELATIVE_PATH'].apply(lambda x: x.split('-')[0])
+                calls_df['FULL_PATH'] = calls_df['RELATIVE_PATH'].apply(lambda x: f's3://{calls_bucket_name}/{x}')
+
+                for file in calls_df['RELATIVE_PATH']:
                     with tempfile.NamedTemporaryFile() as tf:
                         tf.write(requests.get(f'{restore_data_uri}/audio/{file}').content)
                         s3hook.load_file(
@@ -291,73 +307,33 @@ def customer_analytics():
                             bucket_name=calls_bucket_name,
                             replace=True,
                         )
+                
+                return calls_df
 
-            # [extract_twitter(raw_bucket_name=raw_bucket_name, local_data_dir=local_data_dir), 
-            #  extract_customer_support_calls(restore_data_uri=restore_data_uri, calls_bucket_name=calls_bucket_name)]
+            extract_customer_support_calls(calls_bucket_name=calls_bucket_name)
+            extract_twitter(raw_bucket_name=raw_bucket_name)
         
         @task_group()
-        def load_unstructured_data(raw_bucket_name:str, calls_bucket_name:str, calls_directory_stage:str):
-            
-            @task()
-            def load_support_calls(calls_bucket_name:str, calls_directory_stage:str):
-                snowflake_hook = SnowServicesHook(snowflake_conn_id=_SNOWFLAKE_CONN_ID)
-                s3hook = S3Hook(_MINIO_CONN_ID)
-
-                support_calls = Path('include/data/customer_calls.txt').read_text().split('\n')
-
-                snowflake_hook.run(f"""CREATE OR REPLACE STAGE {calls_directory_stage} 
-                                        DIRECTORY = (ENABLE = TRUE) 
-                                        ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
-                                    """)
-
-                with tempfile.TemporaryDirectory() as td:
-                    for file in support_calls:
-                        _ = s3hook.download_file(key=file, 
-                                                        local_path=td,
-                                                        bucket_name=calls_bucket_name, 
-                                                        preserve_file_name=True,
-                                                        use_autogenerated_subdir=False)
-                        
-                    snowflake_hook.run(f"""PUT file://{td}/* @{calls_directory_stage} 
-                                            SOURCE_COMPRESSION = NONE 
-                                            OVERWRITE = TRUE 
-                                            AUTO_COMPRESS = FALSE;
-                                        """)
-
-                snowflake_hook.run(f"ALTER STAGE {calls_directory_stage} REFRESH;")
-
-            load_support_calls(calls_bucket_name, calls_directory_stage)
-            
+        def load_unstructured_data(raw_bucket_name:str, calls_bucket_name:str):
+        
             aql.load_file(task_id='load_twitter_comments',
                 input_file = File(f"S3://{raw_bucket_name}/twitter_comments.parquet", conn_id=_MINIO_CONN_ID),
-                output_table = Table(name='STG_twitter_comments'.upper(), conn_id=_SNOWFLAKE_CONN_ID),
+                output_table = Table(name='STG_twitter_comments'.upper(), conn_id=_POSTGRES_CONN_ID),
                 use_native_support=False,
             )
 
             aql.load_file(task_id='load_comment_training',
-                input_file = File(f"S3://{raw_bucket_name}/comment_training.parquet", conn_id=_MINIO_CONN_ID), 
-                output_table = Table(name='STG_comment_training'.upper(), conn_id=_SNOWFLAKE_CONN_ID),
+                input_file = File(f"S3://{calls_bucket_name}/comment_training.parquet", conn_id=_MINIO_CONN_ID), 
+                output_table = Table(name='STG_comment_training'.upper(), conn_id=_POSTGRES_CONN_ID),
                 use_native_support=False,
             )
         
-        @task()#runner_endpoint=runner_endpoint, python='3.9', requirements=['pandas','numpy','torch','tqdm','more-itertools','transformers>=4.19.0','ffmpeg-python==0.2.0','openai-whisper==v20230308'], snowflake_conn_id=_SNOWFLAKE_CONN_ID)
-        def transcribe_calls(calls_directory_stage:str):
-            import whisper
-            from astronomer.providers.snowflake.hooks.snowservices import SnowServicesHook
-            import requests
-            import tempfile
-            from snowflake.connector.pandas_tools import write_pandas
-            import pandas as pd
-            from pathlib import Path
+            return bucket_names
+        
+        @task()
+        def transcribe_calls(calls_df:pd.DataFrame):
 
             model = whisper.load_model("tiny.en")
-
-            snowflake_hook=SnowServicesHook()
-
-            calls_df = snowflake_hook.get_pandas_df(f'SELECT *, get_presigned_url(@{calls_directory_stage}, LIST_DIR_TABLE.RELATIVE_PATH) as presigned_url FROM DIRECTORY( @{calls_directory_stage});')
-
-            #Extract customer_id from file name
-            calls_df['CUSTOMER_ID']= calls_df['RELATIVE_PATH'].apply(lambda x: x.split('-')[0])
 
             with tempfile.TemporaryDirectory() as tmpdirname:
                 calls_df.apply(lambda x: Path(tmpdirname)\
@@ -367,34 +343,25 @@ def customer_analytics():
                 calls_df['TRANSCRIPT'] = calls_df.apply(lambda x: model.transcribe(Path(tmpdirname)
                                                                             .joinpath(x.RELATIVE_PATH).as_posix())['text'], axis=1)
 
-            snowflake_hook.run('CREATE OR REPLACE TABLE STG_CUSTOMER_CALLS (CUSTOMER_ID number, \
-                                                                            RELATIVE_PATH varchar(60), \
-                                                                            TRANSCRIPT varchar(4000)) ')
+            # snowflake_hook.run('CREATE OR REPLACE TABLE STG_CUSTOMER_CALLS (CUSTOMER_ID number, \
+            #                                                                 RELATIVE_PATH varchar(60), \
+            #                                                                 TRANSCRIPT varchar(4000)) ')
 
-            write_pandas(snowflake_hook.get_conn(), calls_df[['CUSTOMER_ID', 'RELATIVE_PATH', 'TRANSCRIPT']], 'STG_CUSTOMER_CALLS')
+            # write_pandas(snowflake_hook.get_conn(), calls_df[['CUSTOMER_ID', 'RELATIVE_PATH', 'TRANSCRIPT']], 'STG_CUSTOMER_CALLS')
 
-            return 'success'
+            # return 'success'
 
         @task_group()
         def generate_embeddings(openai_apikey:str, weaviate_endpoint_url:str):
             
-            @task() #runner_endpoint=runner_endpoint, requirements=['weaviate-client'], snowflake_conn_id=_SNOWFLAKE_CONN_ID)
-            def generate_training_embeddings(openai_apikey:str, weaviate_endpoint_url:str):
-                import weaviate
-                from weaviate.util import generate_uuid5
-                from snowflake.connector.pandas_tools import write_pandas
-                from astronomer.providers.snowflake.hooks.snowservices import SnowServicesHook
-                from time import sleep
-                import numpy as np
-
-                hook = SnowServicesHook()
-
-                df = hook.get_pandas_df('SELECT * FROM STG_COMMENT_TRAINING;')
-                df['LABEL'] = df['LABEL'].apply(str)
+            @aql.dataframe()
+            def generate_training_embeddings(comment_training_df:pd.DataFrame, openai_apikey:str, weaviate_endpoint_url:str):
+            
+                comment_training_df['LABEL'] = comment_training_df['LABEL'].apply(str)
 
                 #openai works best without empty lines or new lines
-                df = df.replace(r'^\s*$', np.nan, regex=True).dropna()
-                df['REVIEW_TEXT'] = df['REVIEW_TEXT'].apply(lambda x: x.replace("\n",""))
+                comment_training_df = comment_training_df.replace(r'^\s*$', np.nan, regex=True).dropna()
+                comment_training_df['REVIEW_TEXT'] = comment_training_df['REVIEW_TEXT'].apply(lambda x: x.replace("\n",""))
 
                 client = weaviate.Client(
                     url = weaviate_endpoint_url, 
@@ -437,7 +404,7 @@ def customer_analytics():
                 #For openai with rate limit go the VERY slow route
                 #Because we restored weaviate from pre-built embeddings this shouldn't be too long.
                 uuids = []
-                for row_id, row in df.T.items():
+                for row_id, row in comment_training_df.T.items():
                     data_object = {'rEVIEW_TEXT': row[0], 'lABEL': row[1]}
                     uuid = generate_uuid5(data_object, class_obj['class'])
                     sleep_backoff=.5
@@ -463,42 +430,24 @@ def customer_analytics():
                             else:
                                 raise(e)
                 
-                df['UUID']=uuids
+                comment_training_df['UUID']=uuids
                 
-                longest_text = df['REVIEW_TEXT'].apply(len).max()
-
-                hook.run(f'CREATE OR REPLACE TABLE COMMENT_TRAINING (REVIEW_TEXT varchar({longest_text}), \
-                                                                    LABEL varchar(1), \
-                                                                    UUID varchar(36)) ')
-
-                write_pandas(hook.get_conn(), df, 'COMMENT_TRAINING')
-
                 # check load
                 # df = hook.get_pandas_df('SELECT * FROM COMMENT_TRAINING;')
                 # df['VECTOR'] = df.apply(lambda x: client.data_object.get(class_name=class_obj['class'], uuid=x.UUID, with_vector=True)['vector'], axis=1)
                 # df.to_parquet('include/data/comment_training_jic.parquet')
 
-                return 'success'
+                return comment_training_df
 
-            @task() #runner_endpoint=runner_endpoint, requirements=['weaviate-client'], snowflake_conn_id=_SNOWFLAKE_CONN_ID)
-            def generate_twitter_embeddings(openai_apikey:str, weaviate_endpoint_url:str):
-                import weaviate
-                from weaviate.util import generate_uuid5
-                from snowflake.connector.pandas_tools import write_pandas
-                from astronomer.providers.snowflake.hooks.snowservices import SnowServicesHook
-                from time import sleep
-                import numpy as np
-                import pandas as pd
+            @aql.dataframe()
+            def generate_twitter_embeddings(comment_df:pd.DataFrame, openai_apikey:str, weaviate_endpoint_url:str):
 
-                hook = SnowServicesHook()
-
-                df = hook.get_pandas_df('SELECT * FROM STG_TWITTER_COMMENTS;')
-                df['CUSTOMER_ID'] = df['CUSTOMER_ID'].apply(str)
-                df['DATE'] = pd.to_datetime(df['DATE']).dt.strftime("%Y-%m-%dT%H:%M:%S-00:00")
+                comment_df['CUSTOMER_ID'] = comment_df['CUSTOMER_ID'].apply(str)
+                comment_df['DATE'] = pd.to_datetime(comment_df['DATE']).dt.strftime("%Y-%m-%dT%H:%M:%S-00:00")
 
                 #openai embeddings works best without empty lines or new lines
-                df = df.replace(r'^\s*$', np.nan, regex=True).dropna()
-                df['REVIEW_TEXT'] = df['REVIEW_TEXT'].apply(lambda x: x.replace("\n",""))
+                comment_df = comment_df.replace(r'^\s*$', np.nan, regex=True).dropna()
+                comment_df['REVIEW_TEXT'] = comment_df['REVIEW_TEXT'].apply(lambda x: x.replace("\n",""))
 
                 client = weaviate.Client(
                     url = weaviate_endpoint_url, 
@@ -547,7 +496,7 @@ def customer_analytics():
                 #For openai with rate limit go the VERY slow route
                 #Because we restored weaviate from pre-built embeddings this shouldn't be too long.
                 uuids = []
-                for row_id, row in df.T.items():
+                for row_id, row in comment_df.T.items():
                     data_object = {'cUSTOMER_ID': row[0], 'dATE': row[1], 'rEVIEW_TEXT': row[2]}
                     uuid = generate_uuid5(data_object, class_obj['class'])
                     sleep_backoff=.5
@@ -575,41 +524,23 @@ def customer_analytics():
                             else:
                                 raise(e)
 
-                df['UUID']=uuids
-                
-                longest_text = df['REVIEW_TEXT'].apply(len).max()
-
-                hook.run(f'CREATE OR REPLACE TABLE TWITTER_COMMENTS (CUSTOMER_ID varchar(36), \
-                                                                    DATE date, \
-                                                                    REVIEW_TEXT varchar({longest_text}), \
-                                                                    UUID varchar(36));')
-
-                write_pandas(hook.get_conn(), df, 'TWITTER_COMMENTS')
+                comment_df['UUID']=uuids
 
                 # check embeddings
                 # df = hook.get_pandas_df('SELECT * FROM TWITTER_COMMENTS;')
                 # df['VECTOR'] = df.apply(lambda x: client.data_object.get(class_name=class_obj['class'], uuid=x.UUID, with_vector=True)['vector'], axis=1)
                 # df.to_parquet('include/data/twitter_jic.parquet')
 
-                return 'success'
+                return comment_df
             
-            @task() #runner_endpoint=runner_endpoint, requirements=['weaviate-client'], snowflake_conn_id=_SNOWFLAKE_CONN_ID)
-            def generate_call_embeddings(openai_apikey:str, weaviate_endpoint_url:str):
-                import weaviate
-                from weaviate.util import generate_uuid5
-                from snowflake.connector.pandas_tools import write_pandas
-                from astronomer.providers.snowflake.hooks.snowservices import SnowServicesHook
-                from time import sleep
-                import numpy as np
+            @aql.dataframe()
+            def generate_call_embeddings(call_df:pd.DataFrame, openai_apikey:str, weaviate_endpoint_url:str):
 
-                snowflake_hook = SnowServicesHook()
-
-                df = snowflake_hook.get_pandas_df('SELECT * FROM STG_CUSTOMER_CALLS;')
-                df['CUSTOMER_ID'] = df['CUSTOMER_ID'].apply(str)
+                call_df['CUSTOMER_ID'] = call_df['CUSTOMER_ID'].apply(str)
 
                 #openai embeddings works best without empty lines or new lines
-                df = df.replace(r'^\s*$', np.nan, regex=True).dropna()
-                df['TRANSCRIPT'] = df['TRANSCRIPT'].apply(lambda x: x.replace("\n",""))
+                call_df = call_df.replace(r'^\s*$', np.nan, regex=True).dropna()
+                call_df['TRANSCRIPT'] = call_df['TRANSCRIPT'].apply(lambda x: x.replace("\n",""))
 
                 client = weaviate.Client(
                     url = weaviate_endpoint_url, 
@@ -656,7 +587,7 @@ def customer_analytics():
                 #For openai with rate limit go the VERY slow route
                 #Because we restored weaviate from pre-built embeddings this shouldn't be too long.
                 uuids = []
-                for row_id, row in df.T.items():
+                for row_id, row in call_df.T.items():
                     data_object = {'cUSTOMER_ID': row[0], 'rELATIVE_PATH': row[1], 'tRANSCRIPT': row[2]}
                     uuid = generate_uuid5(data_object, class_obj['class'])
                     sleep_backoff=.5
@@ -683,35 +614,28 @@ def customer_analytics():
                             else:
                                 raise(e)
                 
-                df['UUID']=uuids
+                call_df['UUID']=uuids
                 
-                longest_text = df['TRANSCRIPT'].apply(len).max()
-
-                snowflake_hook.run(f'CREATE OR REPLACE TABLE CUSTOMER_CALLS (CUSTOMER_ID varchar(36), \
-                                                                RELATIVE_PATH varchar(20), \
-                                                                TRANSCRIPT varchar({longest_text}), \
-                                                                UUID varchar(36));')
-
-                write_pandas(snowflake_hook.get_conn(), df, 'CUSTOMER_CALLS')
-
-                return 'success'
+                return call_df
             
-            # generate_training_embeddings(openai_apikey=openai_apikey, weaviate_endpoint_url=weaviate_endpoint_url)
-            # generate_twitter_embeddings(openai_apikey=openai_apikey, weaviate_endpoint_url=weaviate_endpoint_url)
-            # generate_call_embeddings(openai_apikey=openai_apikey, weaviate_endpoint_url=weaviate_endpoint_url)
+            generate_training_embeddings(comment_training_df=Table(name='STG_COMMENT_TRAINING', conn_id=_POSTGRES_CONN_ID), 
+                                         openai_apikey=openai_apikey, 
+                                         weaviate_endpoint_url=weaviate_endpoint_url)
+            generate_twitter_embeddings(comment_df=Table(name='STG_COMMENT_TRAINING', conn_id=_POSTGRES_CONN_ID), 
+                                        openai_apikey=openai_apikey, 
+                                        weaviate_endpoint_url=weaviate_endpoint_url)
+            generate_call_embeddings(call_df=Table(name='STG_COMMENT_TRAINING', conn_id=_POSTGRES_CONN_ID), 
+                                     openai_apikey=openai_apikey, 
+                                     weaviate_endpoint_url=weaviate_endpoint_url)
         
-        # extract_unstructured_data(
-        #     raw_bucket_name=bucket_names['raw'], 
-        #     local_data_dir=local_data_dir, 
-        #     calls_bucket_name=calls_bucket_name) >> \
-        # load_unstructured_data(
-        #     raw_bucket_name=bucket_names['raw'], 
-        #     calls_bucket_name=calls_bucket_name, 
-        #     calls_directory_stage=calls_directory_stage) >> \
-        # transcribe_calls(calls_directory_stage=calls_directory_stage) >> \
+        extract_unstructured_data(raw_bucket_name=bucket_names['raw'], calls_bucket_name=bucket_names['calls']) 
+        # >> \
+            # load_unstructured_data(raw_bucket_name=bucket_names['raw'], calls_bucket_name=bucket_names['calls'])
+        
+        # transcribe_calls(calls_df=_calls_df)
         # generate_embeddings(openai_apikey=openai_apikey, weaviate_endpoint_url=weaviate_endpoint_url)
         
-    @task() #runner_endpoint=runner_endpoint, python='3.8', requirements=['boto3', 'tensorflow', 'scikit-learn', 'keras', 'weaviate-client', 'snowflake-ml-python'], snowflake_conn_id=_SNOWFLAKE_CONN_ID)
+    @task() 
     def train_sentiment_classifier(
         weaviate_endpoint_url:str, 
         mlflow_tracking_uri:str,
@@ -720,7 +644,6 @@ def customer_analytics():
         aws_secret_access_key:str
     ) -> str:
 
-        from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
         import pandas as pd
         import numpy as np
         from sklearn.model_selection import train_test_split 
@@ -730,8 +653,6 @@ def customer_analytics():
         from keras import layers
         import weaviate
         import os
-
-        hook = SnowflakeHook()
         
         os.environ['AWS_ACCESS_KEY_ID'] = aws_access_key_id
         os.environ['AWS_SECRET_ACCESS_KEY'] = aws_secret_access_key
@@ -772,26 +693,20 @@ def customer_analytics():
         model_id:str,
     ):
 
-        @task() #runner_endpoint=runner_endpoint, python='3.8', requirements=['keras', 'tensorflow', 'weaviate-client', 'snowflake-ml-python'], snowflake_conn_id=_SNOWFLAKE_CONN_ID)
+        @task() 
         def call_sentiment(
             weaviate_endpoint_url:str,  
             registry_name:str,
             model_id:str,
         ):
-            from astronomer.providers.snowflake.hooks.snowservices import SnowServicesHook
-            from snowflake.snowpark import Session
-            from snowflake.ml.registry import model_registry
             import weaviate
             import numpy as np
 
             pred_table_name = 'PRED_CUSTOMER_CALLS'
 
-            snowflake_hook = SnowServicesHook()
-            conn_params = snowflake_hook._get_conn_params()
-            snowpark_session = Session.builder.configs(conn_params).create()
-            registry = model_registry.ModelRegistry(session=snowpark_session, name=registry_name)
+            registry = model_registry.ModelRegistry(name=registry_name)
 
-            df = snowpark_session.table('CUSTOMER_CALLS').to_pandas()
+            df = ('CUSTOMER_CALLS').to_pandas()
 
             client = weaviate.Client(url = weaviate_endpoint_url)
             df['VECTOR'] = df.apply(lambda x: client.data_object.get(class_name='CustomerCall', uuid=x.UUID, with_vector=True)['vector'], axis=1)
@@ -801,30 +716,24 @@ def customer_analytics():
             
             df['SENTIMENT'] = model.predict(np.stack(df['VECTOR'].values))
 
-            snowpark_session.write_pandas(df, table_name=pred_table_name, auto_create_table=True, overwrite=True)
+            on.write_pandas(df, table_name=pred_table_name, auto_create_table=True, overwrite=True)
 
             return df
 
-        @task() #runner_endpoint=runner_endpoint, python='3.8', requirements=['keras', 'tensorflow', 'weaviate-client', 'snowflake-ml-python'], snowflake_conn_id=_SNOWFLAKE_CONN_ID)
+        @task() 
         def twitter_sentiment(
             weaviate_endpoint_url:str, 
             registry_name:str,
             model_id:str,
         ):
-            from astronomer.providers.snowflake.hooks.snowservices import SnowServicesHook
-            from snowflake.snowpark import Session
-            from snowflake.ml.registry import model_registry
             import weaviate
             import numpy as np
 
             pred_table_name = 'PRED_TWITTER_COMMENTS'
 
-            snowflake_hook = SnowServicesHook()
-            conn_params = snowflake_hook._get_conn_params()
-            snowpark_session = Session.builder.configs(conn_params).create()
-            registry = model_registry.ModelRegistry(session=snowpark_session, name=registry_name)
+            registry = model_registry.ModelRegistry(name=registry_name)
             
-            df = snowpark_session.table('TWITTER_COMMENTS').to_pandas()
+            df = ession.table('TWITTER_COMMENTS').to_pandas()
 
             client = weaviate.Client(url = weaviate_endpoint_url)
             df['VECTOR'] = df.apply(lambda x: client.data_object.get(class_name='CustomerComment', uuid=x.UUID, with_vector=True)['vector'], axis=1)
@@ -834,7 +743,7 @@ def customer_analytics():
             
             df['SENTIMENT'] = model.predict(np.stack(df['VECTOR'].values))
 
-            snowpark_session.write_pandas(df, table_name=pred_table_name, auto_create_table=True, overwrite=True)
+            ssion.write_pandas(df, table_name=pred_table_name, auto_create_table=True, overwrite=True)
 
             return df
 
@@ -876,15 +785,6 @@ def customer_analytics():
                 )
             
             return response
-    
-        @task()
-        def pause_snowservices(snowservice_names:dict) -> dict:
-            ss_hook = SnowServicesHook(snowflake_conn_id = _SNOWFLAKE_CONN_ID)
-
-            for service in list(snowservice_names.values()):
-                _ = ss_hook.suspend_service(service_name=service)
-            
-            return snowservice_names
 
         backup_weaviate(
             class_objects=weaviate_class_objects,
@@ -892,22 +792,11 @@ def customer_analytics():
             weaviate_backup_bucket=weaviate_backup_bucket,
             s3_conn_id=_MINIO_CONN_ID,
             replace_existing=True
-        ) >> \
-        pause_snowservices(snowservice_names)
-
-    _bucket_names = enter() #, _registry_name, _weaviate_endpoint_url
-
-    _structured_data = structured_data(
-        bucket_names=_bucket_names, 
-        local_data_dir=local_data_dir,
         )
-    # _unstructured_data = unstructured_data(
-    #     bucket_names=_bucket_names, 
-    #     local_data_dir=local_data_dir,
-    #     calls_bucket_name=_bucket_names['calls'],
-    #     calls_directory_stage=calls_directory_stage,
-    #     weaviate_endpoint_url=_weaviate_endpoint_url
-    #     )
+    _bucket_names, _weaviate_endpoint_url = enter() #, _registry_name
+
+    _structured_data = structured_data(bucket_names=_bucket_names)
+    _unstructured_data = unstructured_data(bucket_names=_bucket_names, weaviate_endpoint_url=_weaviate_endpoint_url)
     # model_id = train_sentiment_classifier(
     #     weaviate_endpoint_url=_weaviate_endpoint_url,
     #     registry_name=_registry_name
