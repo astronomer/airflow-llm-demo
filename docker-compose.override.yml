@@ -1,7 +1,23 @@
 version: '3.1'
 services:
+  scheduler:
+    networks:
+      - airflow
+    environment:
+      OPENAI_APIKEY: ${OPENAI_APIKEY}
+      AIRFLOW_CONN_POSTGRES_DEFAULT: '{"conn_type": "postgres", "login": "postgres", "password": "postgres", "host": "local_db", "port": 5433, "schema": "postgres"}'
+      #'postgresql://postgres:postgres@local_db:5433/postgres?options=-csearch_path%3Dtmp%5fastro'
+      AIRFLOW_CONN_MINIO_DEFAULT: '{"conn_type": "aws", "login": "minioadmin", "password": "minioadmin", "extra": {"aws_access_key_id": "minioadmin", "aws_secret_access_key": "minioadmin", "endpoint_url": "http://minio:9000", "endpoint": "minio:9000"}}'
+      AIRFLOW__ASTRO_SDK__XCOM_STORAGE_URL: 's3://local-xcom'
+      AIRFLOW__ASTRO_SDK__XCOM_STORAGE_CONN_ID: 'MINIO_DEFAULT'
+      FILE_CONN_ID: 'MINIO_DEFAULT'
+      MLFLOW_TRACKING_URI: 'http://mlflow:5000'
+      MLFLOW_S3_ENDPOINT_URL: 'http://minio:9000'
+      AWS_ACCESS_KEY_ID: 'minioadmin'
+      AWS_SECRET_ACCESS_KEY: 'minioadmin'
   minio:
-    image: quay.io/minio/minio
+    image: quay.io/minio/minio:latest
+    platform: linux/amd64
     command:
     - server 
     - /data 
@@ -10,10 +26,68 @@ services:
     ports:
     - 9000:9000
     - 9001:9001
-    volumes:
-    - ${PWD}/include/minio/data:/data
-    extra_hosts:
-    - "host.docker.internal:host-gateway"
+    # volumes:
+    # - ${PWD}/include/minio/data:/data
+    networks:
+      - airflow
+  streamlit:
+    image: sissyg-streamlit:local
+    build: ./include/streamlit
+    # command:
+    # - python
+    # - -m
+    # - streamlit
+    # - run 
+    # - streamlit_app.py 
+    # - --server.port=8501 
+    # - --server.address=0.0.0.0
+    # - --server.fileWatcherType=none
+    # - --browser.gatherUsageStats=false
+    environment:
+      WEAVIATE_ENDPOINT_URL: 'http://weaviate:8081'
+      OPENAI_APIKEY: ${OPENAI_APIKEY}
+      AWS_ACCESS_KEY_ID: 'minioadmin'
+      AWS_SECRET_ACCESS_KEY: 'minioadmin'
+      S3_ENDPOINT: 'minio:9000'
+    # volumes:
+    # - ${PWD}/include/streamlit/src:/app
+    ports:
+    - 8501:8501
+    networks:
+      - airflow
+  weaviate:
+    image: semitechnologies/weaviate:1.17.3
+    platform: linux/amd64
+    command: "--host 0.0.0.0 --port '8081' --scheme http"
+    ports:
+    - 8081:8081
+    # volumes:
+    #   - ${PWD}/include/weaviate/data:/var/lib/weaviate
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      DEFAULT_VECTORIZER_MODULE: 'text2vec-openai'
+      ENABLE_MODULES: 'text2vec-openai, backup-s3, qna-openai' #ner-transformers,
+      # NER_INFERENCE_API: 'http://ner-transformers:8082'
+      CLUSTER_HOSTNAME: 'node1'
+      BACKUP_S3_BUCKET: 'weaviate-backup'
+      BACKUP_S3_ENDPOINT: 'minio:9000'
+      BACKUP_S3_USE_SSL: 'false'
+      AWS_ACCESS_KEY_ID: 'minioadmin'
+      AWS_SECRET_ACCESS_KEY: 'minioadmin'
+    networks:
+      - airflow
+  # ner-transformers:
+  #   image: semitechnologies/ner-transformers:dbmdz-bert-large-cased-finetuned-conll03-english
+  #   command: 
+  #   - "uvicorn app:app --host 0.0.0.0 --port 8082"
+  #   ports:
+  #   - 8082:8082
+  #   environment:
+  #     ENABLE_CUDA: '0'
+  #   networks:
+  #     - airflow
   mlflow:
     image: ghcr.io/mlflow/mlflow
     command:
@@ -22,65 +96,22 @@ services:
     - '(pip install -q boto3) && (mlflow server --host 0.0.0.0 --backend-store-uri sqlite:////data/mlflow_backend.db --default-artifact-root s3://mlflow-data)'
     ports:
     - 5000:5000
-    env_file: .env
+    environment: 
+      MLFLOW_TRACKING_URI: 'http://mlflow:5000'
+      MLFLOW_S3_ENDPOINT_URL: 'http://minio:9000'
+      AWS_ACCESS_KEY_ID: 'minioadmin'
+      AWS_SECRET_ACCESS_KEY: 'minioadmin'
     volumes:
     - ${PWD}/include/mlflow/data:/data
-    extra_hosts:
-    - 'host.docker.internal:host-gateway'
-  weaviate:
-    image: semitechnologies/weaviate:1.17.3
-    command: "--host 0.0.0.0 --port '8081' --scheme http"
-    ports:
-    - 8081:8081
-    volumes:
-      - ${PWD}/include/weaviate/data:/var/lib/weaviate
-    environment:
-      QUERY_DEFAULTS_LIMIT: 25
-      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
-      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
-      DEFAULT_VECTORIZER_MODULE: 'text2vec-openai'
-      ENABLE_MODULES: 'text2vec-openai, backup-s3, ner-transformers, qna-openai'
-      NER_INFERENCE_API: 'http://host.docker.internal:8082'
-      CLUSTER_HOSTNAME: 'node1'
-      BACKUP_S3_BUCKET: 'weaviate-backup'
-      BACKUP_S3_ENDPOINT: 'host.docker.internal:9000'
-      BACKUP_S3_USE_SSL: 'false'
-    env_file: .env
-    extra_hosts:
-    - 'host.docker.internal:host-gateway'
-  ner-transformers:
-    image: semitechnologies/ner-transformers:dbmdz-bert-large-cased-finetuned-conll03-english
-    command: 
-    - "uvicorn app:app --host 0.0.0.0 --port 8082"
-    ports:
-    - 8082:8082      
-    environment:
-      ENABLE_CUDA: '0'
-    extra_hosts:
-    - 'host.docker.internal:host-gateway'
-  streamlit:
-    image: mpgregor/snowservices-streamlit:latest
-    # command:
-    # - /home/streamlit/.venv/snowpark/bin/python
-    # - -m
-    # - streamlit
-    # - run 
-    # - streamlit_app.py 
-    # - --server.port=8501 
-    # - --server.address=0.0.0.0
-    env_file: .env
-    volumes:
-    - ${PWD}/include/streamlit/src:/app
-    ports:
-    - 8501:8501
-    extra_hosts:
-    - 'host.docker.internal:host-gateway'
+    networks:
+      - airflow
   local_db:
     image: postgres:12.6
     environment:
       PGPORT: 5433
-    env_file: .env
+      POSTGRES_PASSWORD: 'postgres'
+      POSTGRES_USER: 'postgres'
     ports:
       - 5433:5433
-    extra_hosts:
-      - "host.docker.internal:host-gateway"      
+    networks:
+      - airflow

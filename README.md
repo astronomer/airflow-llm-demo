@@ -5,10 +5,7 @@
 
 Overview
 ========
-This demonstration shows an Airflow integration with Weaviate and OpenAI.  Sissy-G Toys is an online retailer for toys and games.  The GroundTruth customer analytics application provides marketing, sales and product managers with a one-stop-shop for analytics.  
-  
-<img style="display: block; float: right; max-width: 80%; height: auto; margin: auto; float: none!important;" src="images/dag_logos.png">  
-  
+This demonstration shows an Airflow integration with Weaviate and OpenAI.  Sissy-G Toys is an online retailer for toys and games.  The GroundTruth customer analytics application provides marketing, sales and product managers with a one-stop-shop for analytics.    
 
 This workflow includes:
 - sourcing structured, unstructured and semistructured data from different systems
@@ -64,20 +61,26 @@ curl -sSL install.astronomer.io | sudo bash -s
 
 2. Clone this repository.  
 ```bash
-git clone https://github.com/astronomer/airflow-ml-demo
+git clone https://github.com/mpgreg/airflow-ml-demo
 cd airflow-ml-demo
 ```
-Edit the `.env` file and update the "OPENAI_APIKEY" parameter with your OpenAI token.
+
+3. Export your OpenAI API key as an environment variable.
+```bash
+export OPENAI_APIKEY='<OPENAI_APIKEY>'
+```
   
-3.  Start an Airflow instance..  
+4.  Start Airflow, Minio, Weaviate, Streamlit and MLflow.
 ```bash
 astro dev start
 ```
   
 4. Run the Airflow DAG in the Airflow UI 
-- Open [localhost:8080](http://localhost:8080) in a browser and login (username: `admin`, password: `admin`)
-- Click the "Play" button for customer_analytics and select "Trigger DAG".
-
+```bash
+astro dev run dags unpause customer_analytics
+astro dev run dags trigger customer_analytics
+```
+Follow the status of the DAG run in the [Airflow UI](http://localhost:8080/dags/customer_analytics/grid) (username: admin, password: admin)
       
 5. Open the streamlit application [http://localhost:8501](http://localhost:8501)
 Other service UIs are available at the the following:

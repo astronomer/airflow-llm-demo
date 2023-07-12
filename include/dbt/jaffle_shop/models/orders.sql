@@ -2,13 +2,13 @@
 
 with orders as (
 
-    select * from {{ source('stage', 'stg_orders') }}
+    select * from stg_orders
 
 ),
 
 payments as (
 
-    select * from {{ source('stage', 'stg_payments') }}
+    select * from stg_payments
 
 ),
 

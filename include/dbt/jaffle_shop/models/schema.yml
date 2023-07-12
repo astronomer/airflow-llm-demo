@@ -1,12 +1,4 @@
 version: 2
-sources:
-  - name: stage
-    dbname: postgres
-    schema:  tmp_astro
-    tables: 
-      - name: stg_customers
-      - name: stg_orders
-      - name: stg_payments
 models:
   - name: customers
     description: This table has basic information about a customer, as well as some derived facts based on a customer's orders

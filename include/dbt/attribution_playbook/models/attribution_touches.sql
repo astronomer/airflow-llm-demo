@@ -2,12 +2,12 @@ with sessions as (
 
     select session_id,
            customer_id,
-           (started_at :: timestamp) as started_at,
+           (started_at :: timestamp) as started_at, 
            (ended_at :: timestamp) as ended_at,
            utm_source,
            utm_medium,
            utm_campaign
-        from {{ source('stage', 'stg_sessions') }}
+        from stg_sessions
 
 ),
 
@@ -16,7 +16,7 @@ customer_conversions as (
     select customer_id,
            (converted_at :: timestamp) as converted_at, 
            revenue 
-        from {{ source('stage', 'stg_customer_conversions') }}
+        from stg_customer_conversions
 
 ),
 

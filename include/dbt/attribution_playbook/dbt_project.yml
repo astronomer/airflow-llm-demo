@@ -3,6 +3,8 @@ name: attribution_playbook
 version: '1.0'
 config-version: 2
 
+profile: 'attribution_playbook'
+
 require-dbt-version: ">=0.16.0"
 
 model-paths: ["models"]

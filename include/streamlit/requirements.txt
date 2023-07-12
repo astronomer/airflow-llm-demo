@@ -1,0 +1,9 @@
+altair==5.0.1
+matplotlib==3.7.2
+streamlit==1.24.1
+streamlit-aggrid==0.3.4.post3
+weaviate-client==3.22.1
+pyarrow==10.0.1
+psycopg2-binary==2.9.6
+minio==7.1.15
+sqlalchemy==2.0.18

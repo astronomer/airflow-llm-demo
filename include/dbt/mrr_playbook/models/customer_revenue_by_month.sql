@@ -5,7 +5,7 @@ with subscription_periods as (
            cast(start_date as date) as start_date, 
            cast(end_date as date) as end_date, 
            monthly_amount 
-        from {{ source('stage', 'stg_subscription_periods') }} 
+        from stg_subscription_periods
     
 
 ),

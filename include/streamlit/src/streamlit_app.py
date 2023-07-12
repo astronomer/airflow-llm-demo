@@ -1,35 +1,24 @@
 import os
-import altair as alt
 import pandas as pd
 import streamlit as st
-from snowflake.snowpark import Session, Window
-from snowflake.snowpark.context import get_active_session
-from snowflake.snowpark import functions as F
-from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 import weaviate
+import minio
+from sqlalchemy import create_engine
+
 from st_aggrid import AgGrid, GridOptionsBuilder
 from st_aggrid.shared import GridUpdateMode
 
 st.set_page_config(layout="wide")
 
-#Connections and Clients
-hook = SnowflakeHook()
-
-if "snowflake_conn_params" not in st.session_state:
-    snowflake_conn_params = hook._get_conn_params()
-    st.session_state['snowflake_conn_params'] = snowflake_conn_params
-else: 
-    snowflake_conn_params = st.session_state['snowflake_conn_params']
-
-if "snowpark_session" not in st.session_state:
-  snowpark_session = Session.builder.configs(snowflake_conn_params).create()
-  st.session_state['snowpark_session'] = snowpark_session
+if 'psql_engine' not in st.session_state:
+    psql_engine = create_engine(st.secrets['postgres']['url'])
+    st.session_state['psql_engine'] = psql_engine
 else:
-  snowpark_session = st.session_state['snowpark_session']
+    psql_engine = st.session_state['psql_engine']
 
 if "weaviate_client" not in st.session_state:
     weaviate_client = weaviate.Client(
-            url = os.environ['WEAVIATE_ENDPOINT_URL'], 
+            url = os.environ['WEAVIATE_ENDPOINT_URL'].replace("\'",""), 
                 additional_headers = {
                     "X-OpenAI-Api-Key": os.environ['OPENAI_APIKEY']
                 }
@@ -38,66 +27,51 @@ if "weaviate_client" not in st.session_state:
 else:
   weaviate_client = st.session_state['weaviate_client']    
 
+if "minio_client" not in st.session_state:
+    minio_client = minio.Minio(
+                endpoint=os.environ['S3_ENDPOINT'],
+                access_key=os.environ['AWS_ACCESS_KEY_ID'],
+                secret_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+                secure=False
+            )
+    st.session_state['minio_client'] = minio_client
+else:
+    minio_client = st.session_state['minio_client']
 
 #Setup data sources
-attribution_df = snowpark_session.table('ATTRIBUTION_TOUCHES')
-customers_df = snowpark_session.table('CUSTOMERS')\
-                                .with_column('CLV', F.round(F.col('CUSTOMER_LIFETIME_VALUE'), 2))
-churn_month_df = snowpark_session.table('CUSTOMER_CHURN_MONTH')
-rev_month_df = snowpark_session.table('CUSTOMER_REVENUE_BY_MONTH')
-rev_df = snowpark_session.table('MRR').drop(['ID'])
-orders_df = snowpark_session.table('ORDERS')
-calls_df = snowpark_session.table('PRED_CUSTOMER_CALLS')
-comments_df = snowpark_session.table('PRED_TWITTER_COMMENTS')
 
-sentiment_df =  calls_df.group_by(F.col('CUSTOMER_ID'))\
-                        .agg(F.avg('SENTIMENT').alias('CALLS_SENTIMENT'))\
-                        .join(comments_df.group_by(F.col('CUSTOMER_ID'))\
-                                .agg(F.avg('SENTIMENT').alias('COMMENTS_SENTIMENT')), 
-                            on='CUSTOMER_ID',
-                            how='right')\
-                        .fillna(0, subset=['CALLS_SENTIMENT'])\
-                        .with_column('SENTIMENT_SCORE', F.round((F.col('CALLS_SENTIMENT') + F.col('COMMENTS_SENTIMENT'))/2, 4))\
-                        .with_column('SENTIMENT_BUCKET', F.call_builtin('WIDTH_BUCKET', F.col('SENTIMENT_SCORE'), 0, 1, 10))
+st.cache_data()
+def attribution_df():
+    return pd.read_sql('select * from attribution_touches', psql_engine)
+_attribution_df = attribution_df()
 
-@st.cache_data
+st.cache_data()
+def calls_df():
+    return pd.read_sql('select * from pred_customer_calls', psql_engine)
+_calls_df = calls_df()
+
+st.cache_data()
+def comments_df():
+    return pd.read_sql('select * from pred_twitter_comments', psql_engine)
+_comments_df = comments_df()
+
+@st.cache_data()
 def ad_spend_df():
-    return attribution_df.select(['UTM_MEDIUM', 'REVENUE'])\
-                                .dropna()\
-                                .group_by(F.col('UTM_MEDIUM'))\
-                                .sum(F.col('REVENUE'))\
-                                .rename('SUM(REVENUE)', 'Revenue')\
-                                .rename('UTM_MEDIUM', 'Medium').to_pandas()
+    return pd.read_sql('select * from pres_ad_spend', psql_engine)
 _ad_spend_df = ad_spend_df()
 
-@st.cache_data
+@st.cache_data()
 def clv_df(row_limit=10):
-    df = customers_df.dropna(subset=['CLV'])\
-                     .join(sentiment_df, 'CUSTOMER_ID', how='left')\
-                     .sort(F.col('CLV'), ascending=False)\
-                     .limit(row_limit)\
-                     .to_pandas()
-    df['NAME']=df['FIRST_NAME']+' '+df['LAST_NAME']
-    df = df[['CUSTOMER_ID', 'NAME', 'FIRST_ORDER', 'MOST_RECENT_ORDER', 'NUMBER_OF_ORDERS', 'CLV', 'SENTIMENT_SCORE']]
+    df = pd.read_sql('select * from pres_clv', psql_engine)
     df.columns = [col.replace('_', ' ') for col in df.columns]
-    df.set_index('CUSTOMER ID', drop=True, inplace=True)
+    df.set_index('customer id', drop=True, inplace=True)
     return df
 _clv_df = clv_df()
 
-@st.cache_data
+@st.cache_data()
 def churn_df(row_limit=10):
-    df = customers_df.select('CUSTOMER_ID', 'FIRST_NAME', 'LAST_NAME', 'CLV')\
-                     .join(rev_df.select('CUSTOMER_ID', 'FIRST_ACTIVE_MONTH', 'LAST_ACTIVE_MONTH', 'CHANGE_CATEGORY'), on='CUSTOMER_ID', how='right')\
-                     .join(sentiment_df, 'CUSTOMER_ID', how='left')\
-                     .dropna(subset=['CLV'])\
-                     .filter(F.col('CHANGE_CATEGORY') == 'churn')\
-                     .sort(F.col('LAST_ACTIVE_MONTH'), ascending=False)\
-                     .limit(row_limit)\
-                     .to_pandas()
-    df['NAME']=df['FIRST_NAME']+' '+df['LAST_NAME']
-    df = df[['CUSTOMER_ID', 'NAME', 'CLV', 'LAST_ACTIVE_MONTH', 'SENTIMENT_SCORE']]
+    df = pd.read_sql('select * from pres_churn', psql_engine)
     df.columns = [col.replace('_', ' ') for col in df.columns]
-    
     return df
 _churn_df = churn_df()
 
@@ -109,13 +83,10 @@ def aggrid_interactive_table(df: pd.DataFrame, height=400):
         enablePivot=True,
     )
 
-    options.configure_side_bar()
-
     options.configure_selection("single")
     selection = AgGrid(
-        df,
+        data=df,
         height=height,
-        fit_columns_on_grid_load=True,
         enable_enterprise_modules=True,
         gridOptions=options.build(),
         theme="streamlit",
@@ -129,7 +100,7 @@ with st.container():
     title_col, logo_col = st.columns([8,2])  
     with title_col:
         st.title("GroundTruth: Customer Analytics")
-        st.subheader("Powered by SnowServices and Streamlit")
+        st.subheader("Powered by Apache Airflow, Snowpark Containers and Streamlit")
     with logo_col:
         st.image('logo_small.png')
 
@@ -140,15 +111,18 @@ with marketing_tab:
         st.header("Return on Ad Spend")
         st.subheader("Digital Channel Revenue")
 
-        medium_list = [i.UTM_MEDIUM for i in attribution_df.select(F.col('UTM_MEDIUM')).na.fill('NONE').distinct().collect()]
+        medium_list = _attribution_df['utm_medium'].fillna('NONE').unique().tolist()
         
-        st.bar_chart(_ad_spend_df, x="MEDIUM", y="REVENUE")
+        st.bar_chart(_ad_spend_df, x="Medium", y="Revenue")
 
         st.subheader('Revenue by Ad Medium')
-        st.table(attribution_df.select(['UTM_MEDIUM', 'UTM_SOURCE', 'REVENUE'])\
-                                .pivot(F.col('UTM_MEDIUM'), medium_list)\
-                                .sum('REVENUE')\
-                                .rename('UTM_SOURCE', 'Source')\
+        st.table(pd.pivot_table(_attribution_df[['utm_medium', 'utm_source', 'revenue']], 
+                       index='utm_source', 
+                       columns='utm_medium', 
+                       aggfunc='sum', 
+                       margins=True, 
+                       margins_name='revenue',
+                       fill_value=0)
         )
 
 with sales_tab:
@@ -156,52 +130,49 @@ with sales_tab:
         col1, col2 = st.columns(2)
         with col1:
             st.header("Top Customers by Customer Lifetime Value")
-            st.dataframe(_clv_df.style.background_gradient(cmap='Reds', subset=['SENTIMENT SCORE'], axis=None))
+            st.dataframe(_clv_df.style.background_gradient(cmap='Reds', subset=['sentiment score'], axis=None))
 
         with col2:
-            st.header("Churned Customers")
-            # st.experimental_data_editor(
-                # _churn_df.style.background_gradient(cmap='Reds', subset=['SENTIMENT SCORE'], axis=None), 
-                # on_change=None, 
-                # args=None, 
-                # kwargs=None
-            # )          
-            selection_churn = aggrid_interactive_table(_churn_df, height=400)
+            st.header("Churned Customers")        
+            selection_churn = aggrid_interactive_table(_churn_df.sort_values('sentiment score', ascending=False), height=400)
 
     with st.container():
-        # selection_churn = aggrid_interactive_table(_churn_df)
 
         if len(selection_churn['selected_rows']) > 0:
-            selected_customer_id = selection_churn['selected_rows'][0]['CUSTOMER ID']
+            selected_customer_id = selection_churn['selected_rows'][0]['customer id']
             
-            selected_calls_df = calls_df.filter(F.col('CUSTOMER_ID') == selected_customer_id)\
-                                        .drop(F.col('UUID'))\
-                                        .sort(F.col('SENTIMENT'), ascending=False)\
-                                        .to_pandas()
-            selected_comments_df = comments_df.filter(F.col('CUSTOMER_ID') == selected_customer_id)\
-                                            .drop(F.col('UUID'))\
-                                            .sort(F.col('SENTIMENT'), ascending=False)\
-                                            .limit(5)\
-                                            .to_pandas()
+            selected_calls_df = _calls_df[_calls_df['customer_id'] == selected_customer_id]\
+                                        .drop(['uuid','vector'], axis=1)\
+                                        .sort_values('sentiment', ascending=False)
+            
+            selected_comments_df = _comments_df[_comments_df['customer_id'] == selected_customer_id]\
+                                        .drop(['uuid','vector'], axis=1)\
+                                        .sort_values('sentiment', ascending=False)
             
             st.header('Customer Support Calls')
-            selection_call = aggrid_interactive_table(selected_calls_df, height=100)
+            selection_call = aggrid_interactive_table(selected_calls_df, height=200)
 
             if len(selection_call['selected_rows']) > 0:
                 st.subheader('Call Transcription')
-                st.write(selection_call['selected_rows'][0]['TRANSCRIPT'])
+                st.write(selection_call['selected_rows'][0]['transcript'])
                 st.subheader('Call Audio')
-                audio_url = hook.get_first(f"SELECT get_presigned_url(@call_stage, LIST_DIR_TABLE.RELATIVE_PATH) as presigned_url \
-                                             FROM DIRECTORY( @call_stage) \
-                                             WHERE RELATIVE_PATH = '{selection_call['selected_rows'][0]['RELATIVE_PATH']}';")[0]
-                st.audio(audio_url, format='audio/wav') 
+                
+                audio_url = selection_call['selected_rows'][0]['full_path']
+                
+                response = minio_client.get_object(bucket_name=audio_url.split('/')[2], 
+                                                object_name=audio_url.split('/')[3])
+                audio = response.data
+                response.close()
+                response.release_conn()
+
+                st.audio(audio, format='audio/wav') 
 
             st.header('Customer Social Media Comments')
             selection_comment = aggrid_interactive_table(selected_comments_df, height=200)
     
             if len(selection_comment['selected_rows']) > 0:
                 st.subheader('Twitter comment text')
-                st.write(selection_comment['selected_rows'][0]['REVIEW_TEXT'])
+                st.write(selection_comment['selected_rows'][0]['review_text'])
 
 with product_tab:
     with st.container():
@@ -215,14 +186,18 @@ with product_tab:
 
             col1, col2 = st.columns(2)
             with col1:
-                comments_result = (
-                    weaviate_client.query
-                    .get("CustomerComment", ["cUSTOMER_ID", "dATE", "rEVIEW_TEXT"])
-                    .with_additional(['id'])
-                    .with_near_text(nearText)
-                    .with_limit(3)
-                    .do()
-                )
+
+                comments_result = weaviate_client.query\
+                                                 .get("CustomerComment", ["cUSTOMER_ID", "dATE", "rEVIEW_TEXT"])\
+                                                 .with_additional(['id'])\
+                                                 .with_near_text(nearText)\
+                                                 .with_limit(3)\
+                                                 .do()
+                
+                if comments_result.get('errors'):
+                    for error in comments_result['errors']:
+                        if 'no api key found' or 'remote client vectorize: failed with status: 401 error' in error['message']:
+                            raise Exception('Cannot vectorize.  Check the OPENAI_API key as environment variable.')
                 
                 near_comments_df = pd.DataFrame(comments_result['data']['Get']['CustomerComment'])\
                         .rename(columns={'cUSTOMER_ID':'CUSTOMER ID', 'dATE':'DATE', 'rEVIEW_TEXT':'TEXT'})
@@ -235,43 +210,36 @@ with product_tab:
                 if len(selection_comment['selected_rows']) > 0:
                     st.write(selection_comment['selected_rows'][0]['TEXT'])
 
-                    st.subheader('Named Entities Extracted: ')
-                    result = (
-                        weaviate_client.query
-                            .get("CustomerComment", ["rEVIEW_TEXT", "_additional {tokens ( properties: [\"rEVIEW_TEXT\"], limit: 1, certainty: 0.5) {entity property word certainty startPosition endPosition }}"])
-                            .with_where(
-                                {
-                                    'path': ["id"],
-                                    'operator': 'Equal',
-                                    'valueString': selection_comment['selected_rows'][0]['UUID']
-                                }
-                            )
-                            # .with_additional(
-                            #     {
-                            #         'tokens': ( properties: [\"rEVIEW_TEXT\"], limit: 1, certainty: 0.5) {entity property word certainty startPosition endPosition }
-                            #     }
-                            # )
-                            .do()
-                    )
-                    NER_string = ''
-                    tokens = result['data']['Get']['CustomerComment'][0]['_additional']['tokens']
-                    for token in range(len(tokens)):
-                        NER_string = NER_string + tokens[token]['word'] + ' : ' + tokens[token]['entity'] + ', '
+                    # st.subheader('Named Entities Extracted: ')
+                    # result = weaviate_client.query\
+                    #         .get("CustomerComment", ["rEVIEW_TEXT", 
+                    #                                  "_additional {tokens ( properties: [\"rEVIEW_TEXT\"], limit: 1, certainty: 0.5) {entity property word certainty startPosition endPosition }}"])\
+                    #         .with_where(
+                    #             {
+                    #                 'path': ["id"],
+                    #                 'operator': 'Equal',
+                    #                 'valueString': selection_comment['selected_rows'][0]['UUID']
+                    #             }
+                    #         )\
+                    #         .do()
+                    
+                    # NER_string = ''
+                    # tokens = result['data']['Get']['CustomerComment'][0]['_additional']['tokens']
+                    # for token in range(len(tokens)):
+                    #     NER_string = NER_string + tokens[token]['word'] + ' : ' + tokens[token]['entity'] + ', '
 
-                    st.write(NER_string)
+                    # st.write(NER_string)
 
             with col2:
-                call_result = (
-                    weaviate_client.query
-                    .get("CustomerCall", ["cUSTOMER_ID", "dATE", "tRANSCRIPT"])
-                    .with_additional(['id'])
-                    .with_near_text(nearText)
-                    .with_limit(3)
-                    .do()
-                )
-
+                call_result = weaviate_client.query\
+                                             .get("CustomerCall", ["cUSTOMER_ID", "tRANSCRIPT"])\
+                                             .with_additional(['id'])\
+                                             .with_near_text(nearText)\
+                                             .with_limit(3)\
+                                             .do()\
+                
                 near_calls_df = pd.DataFrame(call_result['data']['Get']['CustomerCall'])\
-                        .rename(columns={'cUSTOMER_ID':'CUSTOMER ID', 'dATE':'DATE', 'tRANSCRIPT':'TEXT'})
+                        .rename(columns={'cUSTOMER_ID':'CUSTOMER ID', 'tRANSCRIPT':'TEXT'})
                 near_calls_df['UUID'] = near_calls_df['_additional'].apply(lambda x: x['id'])
                 near_calls_df.drop('_additional', axis=1, inplace=True)
 
@@ -281,26 +249,26 @@ with product_tab:
                 if len(selection_call['selected_rows']) > 0:
                     st.write(selection_call['selected_rows'][0]['TEXT'])
 
-                    st.subheader('Named Entities Extracted: ')
-                    result = (
-                        weaviate_client.query
-                            .get("CustomerCall", ["tRANSCRIPT", "_additional {tokens ( properties: [\"tRANSCRIPT\"], limit: 1, certainty: 0.7) {entity property word certainty startPosition endPosition }}"])
-                            .with_where(
-                                {
-                                    'path': ["id"],
-                                    'operator': 'Equal',
-                                    'valueString': selection_call['selected_rows'][0]['UUID']
-                                }
-                            )
-                            .do()
-                    )
+                    # st.subheader('Named Entities Extracted: ')
+                    # result = weaviate_client.query\
+                    #             .get("CustomerCall", 
+                    #                  ["tRANSCRIPT", 
+                    #                   "_additional {tokens ( properties: [\"tRANSCRIPT\"], limit: 1, certainty: 0.7) {entity property word certainty startPosition endPosition }}"])\
+                    #             .with_where(
+                    #                 {
+                    #                     'path': ["id"],
+                    #                     'operator': 'Equal',
+                    #                     'valueString': selection_call['selected_rows'][0]['UUID']
+                    #                 }
+                    #             )\
+                    #             .do()
+                    
+                    # NER_string = ''
+                    # tokens = result['data']['Get']['CustomerCall'][0]['_additional']['tokens']
+                    # for token in range(len(tokens)):
+                    #     NER_string = NER_string + tokens[token]['word'] + ' : ' + tokens[token]['entity'] + ', '
 
-                    NER_string = ''
-                    tokens = result['data']['Get']['CustomerCall'][0]['_additional']['tokens']
-                    for token in range(len(tokens)):
-                        NER_string = NER_string + tokens[token]['word'] + ' : ' + tokens[token]['entity'] + ', '
-
-                    st.write(NER_string)
+                    # st.write(NER_string)
                     
 
 
@@ -319,16 +287,19 @@ with product_tab:
                     "properties": ["rEVIEW_TEXT"]
                 }
 
-                result = (
-                weaviate_client.query
-                    .get("CustomerComment", ["rEVIEW_TEXT", "_additional {answer {hasAnswer property result startPosition endPosition} }"])
-                    .with_ask(comment_ask)
-                    .with_limit(1)
-                    .do()
-                )
+                result = weaviate_client.query\
+                            .get("CustomerComment", ["rEVIEW_TEXT", 
+                                                     "_additional {answer {hasAnswer property result startPosition endPosition} }"])\
+                            .with_ask(comment_ask)\
+                            .with_limit(1)\
+                            .do()
+                
+                if result.get('errors'):
+                        for error in result['errors']:
+                            if 'no api key found' or 'remote client vectorize: failed with status: 401 error' in error['message']:
+                                raise Exception('Cannot vectorize.  Check the OPENAI_API key as environment variable.')
 
                 if result['data']['Get']['CustomerComment']: 
-                    # if result['data']['Get']['CustomerComment'][0]['_additional']['answer']['hasAnswer']:
                     st.write(result['data']['Get']['CustomerComment'][0]['rEVIEW_TEXT'])
 
             with col2:
@@ -338,96 +309,13 @@ with product_tab:
                     "properties": ["tRANSCRIPT"]
                 }
 
-                result = (
-                weaviate_client.query
-                    .get("CustomerCall", ["tRANSCRIPT", "_additional {answer {hasAnswer property result startPosition endPosition} }"])
-                    .with_ask(call_ask)
-                    .with_limit(1)
-                    .do()
-                )
+                result = weaviate_client.query\
+                            .get("CustomerCall", 
+                                ["tRANSCRIPT", 
+                                "_additional {answer {hasAnswer property result startPosition endPosition} }"])\
+                            .with_ask(call_ask)\
+                            .with_limit(1)\
+                            .do()
 
                 if result['data']['Get']['CustomerCall']: 
-                    # if result['data']['Get']['CustomerCall'][0]['_additional']['answer']['hasAnswer']:
                     st.write(result['data']['Get']['CustomerCall'][0]['tRANSCRIPT'])
-
-
-    
-
-# uuids = [row['UUID'] for row in comments_df.select('UUID').collect()]
-
-# result = weaviate_client.query.get("CustomerComment", ["cUSTOMER_ID", "dATE", "rEVIEW_TEXT"]).do()
-
-# weaviate_client.query.get("CustomerComment", ["cUSTOMER_ID", "dATE", "rEVIEW_TEXT"]).with_additional(['id']).do()
-
-# for uuid in uuids:
-#     len(weaviate_client.data_object.get(uuid=uuid, with_vector=True)['vector'])
-
-# weaviate_client.data_object.get(uuid=uuids[12345], with_vector=False)['properties'].keys()
-
-
-
-        
-    # nearText = {"concepts": ["magic"]}
-    # result = (
-    #     client.query
-    #     .get("CustomerComment", ["customer_id", "date", "review_text"])
-    #     .with_near_text(nearText)
-    #     .with_limit(3)
-    #     .do()
-    # )
-    # print(json.dumps(result, indent=4))
-
-    # test_vector = client.data_object.get(uuid=uuids[57], with_vector=True)
-    # test_vector['properties']
-    # len(test_vector['vector'])
-    # result = (
-    #     client.query
-    #     .get("CustomerComment", ["customer_id", "date", "review_text"])
-    #     .with_near_vector({
-    #         "vector": test_vector['vector'],
-    #         "certainty": 0.5
-    #     })
-    #     .with_limit(4)
-    #     .with_additional(['certainty'])
-    #     .do()
-    # )
-    # print(json.dumps(result, indent=4))
-
-    # where_filter = {
-    #     "path": ["customer_id"],
-    #     "operator": "Equal",
-    #     "valueNumber": 25,
-    # }
-
-    # result = (
-    #     client.query
-    #     .get("CustomerComment", ["customer_id", "date", "review_text"])
-    #     .with_where(where_filter)
-    #     .do()
-    # )
-    # print(json.dumps(result, indent=4))
-
-
-
-# audio_file = open('audio1.wav', 'rb')
-                # audio_bytes = audio_file.read()
-                # st.audio(audio_bytes, format='audio/wav')
-
-
-# selection_call = {
-                #     'selected_rows': {
-                #         0:
-                #             {
-                #                 "_selectedRowNodeInfo":{
-                #                     "nodeRowIndex":0,
-                #                     "nodeId":"0"
-                #                 },
-                #                 "CUSTOMER_ID":"54",
-                #                 "DATE":"2018-01-07T00:00:00.000",
-                #                 "RELATIVE_PATH":"MLKH_Sr37.wav",
-                #                 "TRANSCRIPT":" Today Giza is a suburb of roughly growing Cairo, the largest city in Africa and the fifth largest in the world.",
-                #                 "SENTIMENT":0.7652763128
-                #             }
-                #     }
-                # }
-                

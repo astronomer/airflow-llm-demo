@@ -1,10 +1,4 @@
 version: 2
-sources:
-  - name: stage
-    dbname: postgres
-    schema:  tmp_astro
-    tables: 
-      - name: stg_subscription_periods
 models:
   - name: subscription_periods
     tests:

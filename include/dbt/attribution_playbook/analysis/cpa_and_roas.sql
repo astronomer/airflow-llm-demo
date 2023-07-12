@@ -1,6 +1,6 @@
 with ad_spend as (
 
-    select * from {{ source('stage', 'stg_ad_spend') }}
+    select * from stg_ad_spend
 
 ),
 
