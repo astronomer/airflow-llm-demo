@@ -61,8 +61,8 @@ curl -sSL install.astronomer.io | sudo bash -s
 
 2. Clone this repository.  
 ```bash
-git clone https://github.com/mpgreg/airflow-ml-demo
-cd airflow-ml-demo
+git clone https://github.com/astronomer/airflow-llm-demo
+cd airflow-llm-demo
 ```
 
 3. Export your OpenAI API key as an environment variable.
