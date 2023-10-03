@@ -1,0 +1,59 @@
+{
+    "classes": [
+        {
+            "class": "CommentTraining",
+            "vectorizer": "text2vec-openai",
+            "properties": [
+                {
+                    "name": "rEVIEW_TEXT",
+                    "dataType": ["text"]
+                },
+                {
+                    "name": "lABEL",
+                    "dataType": ["string"],
+                    "moduleConfig": {"text2vec-openai": {"skip": "True"}}
+                }
+            ]
+        },
+        {
+            "class": "CustomerComment",
+            "vectorizer": "text2vec-openai",
+            "properties": [
+                {
+                "name": "CUSTOMER_ID",
+                "dataType": ["string"],
+                "moduleConfig": {"text2vec-openai": {"skip": "True"}}
+                },
+                {
+                "name": "DATE",
+                "dataType": ["date"],
+                "moduleConfig": {"text2vec-openai": {"skip": "True"}}
+                },
+                {
+                "name": "REVIEW_TEXT",
+                "dataType": ["text"]
+                }
+            ]
+        },
+        {
+            "class": "CustomerCall",
+            "vectorizer": "text2vec-openai",
+            "properties": [
+                {
+                "name": "CUSTOMER_ID",
+                "dataType": ["string"],
+                "moduleConfig": {"text2vec-openai": {"skip": "True"}}
+                },
+                {
+                "name": "RELATIVE_PATH",
+                "dataType": ["string"],
+                "moduleConfig": {"text2vec-openai": {"skip": "True"}}
+                },
+                {
+                "name": "TRANSCRIPT",
+                "dataType": ["text"]
+                }
+            ]
+        }
+    ]
+}
