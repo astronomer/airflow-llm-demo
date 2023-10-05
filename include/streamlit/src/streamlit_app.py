@@ -2,41 +2,31 @@ import os
 import pandas as pd
 import streamlit as st
 import weaviate
-import minio
 from sqlalchemy import create_engine
+from weaviate_provider.hooks.weaviate import WeaviateHook
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
 from st_aggrid import AgGrid, GridOptionsBuilder
 from st_aggrid.shared import GridUpdateMode
 
 st.set_page_config(layout="wide")
 
+_WEAVIATE_CONN_ID = 'weaviate_default'
+_S3_CONN_ID = 'minio_default'
+
 if 'psql_engine' not in st.session_state:
-    psql_engine = create_engine(st.secrets['postgres']['url'])
+    psql_engine = create_engine(st.secrets['postgres']['url'], connect_args={'options': '-csearch_path=demo'})
     st.session_state['psql_engine'] = psql_engine
 else:
     psql_engine = st.session_state['psql_engine']
 
 if "weaviate_client" not in st.session_state:
-    weaviate_client = weaviate.Client(
-            url = os.environ['WEAVIATE_ENDPOINT_URL'].replace("\'",""), 
-                additional_headers = {
-                    "X-OpenAI-Api-Key": os.environ['OPENAI_APIKEY']
-                }
-            )
+    weaviate_client = WeaviateHook(_WEAVIATE_CONN_ID).get_conn()
     st.session_state['weaviate_client'] = weaviate_client
 else:
   weaviate_client = st.session_state['weaviate_client']    
 
-if "minio_client" not in st.session_state:
-    minio_client = minio.Minio(
-                endpoint=os.environ['S3_ENDPOINT'],
-                access_key=os.environ['AWS_ACCESS_KEY_ID'],
-                secret_key=os.environ['AWS_SECRET_ACCESS_KEY'],
-                secure=False
-            )
-    st.session_state['minio_client'] = minio_client
-else:
-    minio_client = st.session_state['minio_client']
+s3_hook = S3Hook(_S3_CONN_ID)
 
 #Setup data sources
 
@@ -67,7 +57,7 @@ def clv_df(row_limit=10):
     df.set_index('customer id', drop=True, inplace=True)
     return df
 _clv_df = clv_df()
-
+ 
 @st.cache_data()
 def churn_df(row_limit=10):
     df = pd.read_sql('select * from pres_churn', psql_engine)
@@ -142,11 +132,11 @@ with sales_tab:
             selected_customer_id = selection_churn['selected_rows'][0]['customer id']
             
             selected_calls_df = _calls_df[_calls_df['customer_id'] == selected_customer_id]\
-                                        .drop(['uuid','vector'], axis=1)\
+                                        .drop(['vector'], axis=1)\
                                         .sort_values('sentiment', ascending=False)
             
             selected_comments_df = _comments_df[_comments_df['customer_id'] == selected_customer_id]\
-                                        .drop(['uuid','vector'], axis=1)\
+                                        .drop(['vector'], axis=1)\
                                         .sort_values('sentiment', ascending=False)
             
             st.header('Customer Support Calls')
@@ -158,12 +148,12 @@ with sales_tab:
                 st.subheader('Call Audio')
                 
                 audio_url = selection_call['selected_rows'][0]['full_path']
+
+                response = s3_hook.get_key(bucket_name=audio_url.split('/')[2],
+                                           key=audio_url.split('/')[3]).get()['Body']
                 
-                response = minio_client.get_object(bucket_name=audio_url.split('/')[2], 
-                                                object_name=audio_url.split('/')[3])
-                audio = response.data
+                audio = response.read()
                 response.close()
-                response.release_conn()
 
                 st.audio(audio, format='audio/wav') 
 

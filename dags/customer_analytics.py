@@ -1,6 +1,6 @@
 from datetime import datetime, date
 import os
-from textwrap import dedent
+import hashlib
 from pathlib import Path
 import os
 import pandas as pd
@@ -9,17 +9,26 @@ import zipfile
 from tempfile import TemporaryDirectory
 import urllib
 import whisper
+from lightgbm import LGBMClassifier
+from sklearn.model_selection import train_test_split 
+from mlflow.lightgbm import log_model, load_model
+import mlflow
 
 from astro import sql as aql
 from astro.files import File 
 from astro.sql.table import Table, Metadata
 from airflow.decorators import dag, task, task_group
+from airflow.operators.smooth import SmoothOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from weaviate_provider.hooks.weaviate import WeaviateHook
 from weaviate_provider.operators.weaviate import (
     WeaviateRestoreOperator,
+    WeaviateCreateSchemaOperator,
     WeaviateCheckSchemaBranchOperator,
+    WeaviateCheckSchemaOperator,
     WeaviateImportDataOperator,
+    WeaviateRetrieveAllOperator,
     )
 from weaviate.util import generate_uuid5
 
@@ -29,11 +38,14 @@ _S3_CONN_ID = 'minio_default'
 _DBT_BIN = '/home/astro/.venv/dbt/bin/dbt'
 
 restore_data_uri = 'https://astronomer-demos-public-readonly.s3.us-west-2.amazonaws.com/sissy-g-toys-demo/data'
-bucket_names = {'mlflow': 'mlflow-data', 'calls': 'customer-calls', 'weaviate': 'weaviate-backup'}
+bucket_names = {'mlflow': 'mlflow-data', 'calls': 'customer-calls', 'weaviate': 'weaviate-backup', 'xcom': 'local-xcom'}
 data_sources = ['ad_spend', 'sessions', 'customers', 'payments', 'subscription_periods', 'customer_conversions', 'orders']
 twitter_sources = ['twitter_comments', 'comment_training']
 weaviate_class_objects = {'CommentTraining': {'count': 1987}, 'CustomerComment': {'count': 12638}, 'CustomerCall': {'count': 43}}
 pg_schema = 'demo'
+
+weaviate_client = WeaviateHook(_WEAVIATE_CONN_ID).get_conn()
+s3_hook = S3Hook(_S3_CONN_ID)
 
 default_args={
     "weaviate_conn_id": _WEAVIATE_CONN_ID,
@@ -42,27 +54,23 @@ default_args={
 @dag(schedule=None, start_date=datetime(2023, 1, 1), catchup=False, default_args=default_args)
 def customer_analytics():
     
-    # @task()
-    # def drop_schema():
-    #     PostgresHook(_POSTGRES_CONN_ID).run(f'DROP SCHEMA IF EXISTS {pg_schema} CASCADE;')
-    #     return pg_schema
-
     @task()
     def create_buckets(replace_existing=False) -> dict:
-        hook = S3Hook(_S3_CONN_ID)
 
         for bucket_name in list(bucket_names.values()):
             if replace_existing:
-                if hook.check_for_bucket(bucket_name):
-                    hook.delete_bucket(bucket_name)
+                if s3_hook.check_for_bucket(bucket_name):
+                    s3_hook.delete_bucket(bucket_name=bucket_name, force_delete=True)
             try:
-                hook.create_bucket(bucket_name)
+                s3_hook.create_bucket(bucket_name)
             except Exception as e:
                 if e.__class__.__name__ == 'botocore.errorfactory.BucketAlreadyOwnedByYou':
                     pass
         
         return bucket_names
         
+    _bucket_names = create_buckets(replace_existing=True) 
+
     @task()
     def download_weaviate_backup() -> str:
         """
@@ -82,13 +90,8 @@ def customer_analytics():
         This task will download the backup.zip and make it available in a docker mounted 
         filesystem for the weaviate restore task.  Normally this would be in an cloud storage.
         """
-        import urllib
-        import zipfile
-        import tempfile
-
-        hook = S3Hook(_S3_CONN_ID)
-
-        weaviate_restore_uri = f'{restore_data_uri}/weaviate-backup/backup.zip'
+        
+        weaviate_restore_uri = f"{restore_data_uri}/{bucket_names['weaviate']}/backup.zip"
 
         with TemporaryDirectory() as td:
             zip_path, _ = urllib.request.urlretrieve(weaviate_restore_uri)
@@ -99,9 +102,15 @@ def customer_analytics():
                 for name in files:
                     filename = os.path.join(root, name)
 
-                    hook.load_file(bucket_name=bucket_names['weaviate'],
-                                   filename=filename,
-                                   key='/'.join(filename.split('/')[3:]))
+                    s3_hook.load_file(bucket_name=bucket_names['weaviate'],
+                                      filename=filename,
+                                      key='/'.join(filename.split('/')[3:]))
+
+    _download_weaviate_backup = download_weaviate_backup()
+
+    _create_schema = WeaviateCreateSchemaOperator(task_id='create_schema',
+                                                  class_object_data='file://include/weaviate_schema.json',
+                                                  existing='replace')
 
     _restore_weaviate = WeaviateRestoreOperator(task_id='restore_weaviate',
                                                 backend='s3', 
@@ -109,7 +118,17 @@ def customer_analytics():
                                                 include=list(weaviate_class_objects.keys()),
                                                 replace_existing=True)
              
-    #structured_data
+    _check_schema = WeaviateCheckSchemaBranchOperator(task_id='check_schema', 
+                                                      weaviate_conn_id=_WEAVIATE_CONN_ID,
+                                                      class_object_data='file://include/weaviate_schema.json',
+                                                      follow_task_ids_if_true=["generate_training_embeddings",
+                                                                               "generate_twitter_embeddings",
+                                                                               "generate_call_embeddings"
+                                                                               ],
+                                                      follow_task_ids_if_false=["alert_schema"])
+
+    _alert_schema = SmoothOperator(task_id='alert_schema')
+
     @task_group()
     def load_structured_data():
         for source in data_sources:
@@ -117,7 +136,9 @@ def customer_analytics():
                 input_file = File(f"{restore_data_uri}/{source}.csv"), 
                 output_table = Table(name=f'stg_{source}', metadata=Metadata(schema=pg_schema), conn_id=_POSTGRES_CONN_ID)
             )
-        
+    
+    _load_structured_data = load_structured_data()
+
     @task_group()
     def transform_structured():
         
@@ -193,7 +214,7 @@ def customer_analytics():
             customer_churn_month['is_last_month'] = False
 
             mrr = pd.concat([customer_revenue_by_month, customer_churn_month])
-            mrr['id'] = mrr['customer_id'].apply(generate_uuid5)
+            mrr['id'] = mrr['customer_id'].apply(lambda x: hashlib.md5(str(x).encode()).hexdigest())
             mrr['previous_month_is_active'] = mrr.sort_values(['customer_id', 'date_month'])\
                                                     .groupby('customer_id')['is_active']\
                                                     .shift(1)\
@@ -213,20 +234,14 @@ def customer_analytics():
                                      np.where(mrr['mrr_change'] > 0, 'upgrade',
                                      np.where(mrr['mrr_change'] < 0, 'downgrade', np.nan)))))
             mrr['renewal_amount'] = mrr[['mrr','previous_month_mrr']].min(axis=1)
+            
+            mrr.reset_index(inplace=True, drop=True)
 
             return mrr
 
         @aql.dataframe()
-        def attribution_playbook(customer_conversions_df:pd.DataFrame, 
-                                 sessions_df=pd.DataFrame):
-            hook=PostgresHook(_POSTGRES_CONN_ID)
-            customers_df = hook.get_pandas_df(f'SELECT * FROM demo.stg_customers;')
-            orders_df = hook.get_pandas_df(f'SELECT * FROM demo.stg_orders;')
-            payments_df = hook.get_pandas_df(f'SELECT * FROM demo.stg_payments;')
-            subscription_periods = hook.get_pandas_df(f'SELECT * FROM demo.stg_subscription_periods;')
-            customer_conversions_df = hook.get_pandas_df(f'SELECT * FROM demo.stg_customer_conversions;')
-            sessions_df = hook.get_pandas_df(f'SELECT * FROM demo.stg_sessions;')
-
+        def attribution_playbook(customer_conversions_df:pd.DataFrame, sessions_df:pd.DataFrame):
+            
             attribution_touches = sessions_df.merge(customer_conversions_df)
             attribution_touches['started_at'] = pd.to_datetime(attribution_touches['started_at'])
             attribution_touches['converted_at'] = pd.to_datetime(attribution_touches['converted_at'])
@@ -252,544 +267,383 @@ def customer_analytics():
                                                                      attribution_touches['forty_twenty_forty_points'])
             attribution_touches['linear_revenue'] = np.multiply(attribution_touches['revenue'], 
                                                                      attribution_touches['linear_points'])
+            
+            attribution_touches.reset_index(inplace=True, drop=True)
 
             return attribution_touches
 
-
-    @aql.dataframe()
-    def extract_customer_support_calls(bucket_names:dict, replace=False):
-
-        hook = S3Hook(_S3_CONN_ID)
-
-        with TemporaryDirectory() as td:
-            zip_path, _ = urllib.request.urlretrieve(restore_data_uri+'/customer_calls.zip')
-            with zipfile.ZipFile(zip_path, "r") as f:
-                f.extractall(td)
-
-            for file in os.listdir(td+'/customer_calls'):
-                try:
-                    hook.load_file(filename=td+'/customer_calls/'+file,
-                                bucket_name=bucket_names['calls'],
-                                key=file,
-                                replace=replace)
-                except Exception as e:
-                    if not replace and 'already exists' in e.args:
-                        pass
-
-        df = pd.read_csv(restore_data_uri+'/customer_calls.txt', names=['RELATIVE_PATH'])
-        df['CUSTOMER_ID'] = df['RELATIVE_PATH'].apply(lambda x: x.split('-')[0])
-        df['FULL_PATH'] = df['RELATIVE_PATH'].apply(lambda x: f"s3://{bucket_names['calls']}/{x}")
+        _customers = jaffle_shop(customers_df=Table(name='stg_customers', 
+                                                    metadata=Metadata(schema=pg_schema), 
+                                                    conn_id=_POSTGRES_CONN_ID),
+                                 orders_df=Table(name='stg_orders', 
+                                                 metadata=Metadata(schema=pg_schema), 
+                                                 conn_id=_POSTGRES_CONN_ID),
+                                 payments_df=Table(name='stg_payments', 
+                                                   metadata=Metadata(schema=pg_schema), 
+                                                   conn_id=_POSTGRES_CONN_ID),
+                                 output_table=Table(name='customers', 
+                                                    metadata=Metadata(schema=pg_schema),
+                                                    conn_id=_POSTGRES_CONN_ID))
         
-        return df
+        _mrr = mrr_playbook(subscription_periods=Table(name='stg_subscription_periods', 
+                                                       metadata=Metadata(schema=pg_schema), 
+                                                       conn_id=_POSTGRES_CONN_ID),
+                            output_table=Table(name='mrr', 
+                                               metadata=Metadata(schema=pg_schema), 
+                                               conn_id=_POSTGRES_CONN_ID))
+        
+        _attribution_touches = attribution_playbook(customer_conversions_df=Table(name='stg_customer_conversions', 
+                                                                                  metadata=Metadata(schema=pg_schema), 
+                                                                                  conn_id=_POSTGRES_CONN_ID),
+                                                    sessions_df=Table(name='stg_sessions', 
+                                                                      metadata=Metadata(schema=pg_schema), 
+                                                                      conn_id=_POSTGRES_CONN_ID),
+                                                    output_table=Table(name='attribution_touches', 
+                                                                             metadata=Metadata(schema=pg_schema), 
+                                                                             conn_id=_POSTGRES_CONN_ID))
+        
+        return _customers, _mrr, _attribution_touches
+
+    _customers, _mrr, _attribution_touches = transform_structured()
+
+    @task_group()
+    def load_unstructured_data():
+        @aql.dataframe()
+        def extract_customer_support_calls(bucket_names:dict, replace=False):
+
+            with TemporaryDirectory() as td:
+                zip_path, _ = urllib.request.urlretrieve(restore_data_uri+'/customer_calls.zip')
+                with zipfile.ZipFile(zip_path, "r") as f:
+                    f.extractall(td)
+
+                for file in os.listdir(td+'/customer_calls'):
+                    try:
+                        s3_hook.load_file(filename=td+'/customer_calls/'+file,
+                                    bucket_name=bucket_names['calls'],
+                                    key=file,
+                                    replace=replace)
+                    except Exception as e:
+                        if not replace and 'already exists' in e.args:
+                            pass
+
+            df = pd.read_csv(restore_data_uri+'/customer_calls.txt', names=['RELATIVE_PATH'])
+            df['CUSTOMER_ID'] = df['RELATIVE_PATH'].apply(lambda x: x.split('-')[0])
+            df['FULL_PATH'] = df['RELATIVE_PATH'].apply(lambda x: f"s3://{bucket_names['calls']}/{x}")
+            
+            return df
+        
+        _stg_calls_table = extract_customer_support_calls(bucket_names=_bucket_names,
+                                                          replace=False,
+                                                          output_table=Table(name='stg_customer_calls', 
+                                                                             metadata=Metadata(schema=pg_schema), 
+                                                                             conn_id=_POSTGRES_CONN_ID))
+        
+        _stg_comment_table = aql.load_file(task_id='load_twitter_comments',
+                                           input_file = File(f'{restore_data_uri}/twitter_comments.parquet'))
+
+        _stg_training_table = aql.load_file(task_id='load_comment_training',
+                                            input_file = File(f'{restore_data_uri}/comment_training.parquet'))
+            
+        return _stg_calls_table, _stg_comment_table, _stg_training_table
     
-    _stg_comment_table = aql.load_file(task_id='load_twitter_comments',
-        input_file = File(f'{restore_data_uri}/twitter_comments.parquet'),
-        output_table = Table(name='stg_twitter_comments', 
-                                metadata=Metadata(schema=pg_schema), 
-                                conn_id=_POSTGRES_CONN_ID),
-        use_native_support=False,
-    )
-
-    _stg_training_table = aql.load_file(task_id='load_comment_training',
-        input_file = File(f'{restore_data_uri}/comment_training.parquet'), 
-        output_table = Table(name='stg_comment_training', 
-                                metadata=Metadata(schema=pg_schema), 
-                                conn_id=_POSTGRES_CONN_ID),
-        use_native_support=False,
-    )
-        
+    _stg_calls_table, _stg_comment_table, _stg_training_table = load_unstructured_data()    
+    
     @aql.dataframe()
     def transcribe_calls(df:pd.DataFrame):
 
-        hook = S3Hook(_S3_CONN_ID)
-
         model = whisper.load_model('tiny.en', download_root=os.getcwd())
+        files = s3_hook.list_keys(bucket_names['calls'])
 
         with TemporaryDirectory() as tmpdirname:
-            for file in hook.list_keys(bucket_names['calls']):
-                obj = hook.get_key(key=file,
+            for file in files :
+                obj = s3_hook.get_key(key=file,
                                    bucket_name=bucket_names['calls'])
                 
-                _ = Path(tmpdirname).joinpath(file).write_bytes(obj.get()['Body'].read())
+                Path(tmpdirname).joinpath(file).write_bytes(obj.get()['Body'].read())
                                         
             df['TRANSCRIPT'] = df.apply(lambda x: model.transcribe(Path(tmpdirname).joinpath(x.RELATIVE_PATH).as_posix(), fp16=False)['text'], axis=1)
+        
+        df.columns=['rELATIVE_PATH', 'cUSTOMER_ID', 'fULL_PATH',  'tRANSCRIPT']
+        df['cUSTOMER_ID'] = df['cUSTOMER_ID'].apply(str)
+
+        df = df.replace(r'^\s*$', np.nan, regex=True).dropna()
+        df['tRANSCRIPT'] = df['tRANSCRIPT'].apply(lambda x: x.replace("\n",""))
+
+        df['UUID'] = df[['cUSTOMER_ID', 'rELATIVE_PATH', 'tRANSCRIPT']]\
+                            .apply(lambda x: generate_uuid5(x.to_dict(), 'CustomerCall'), axis=1)
+
+        return df
+    
+    _stg_transcribed_calls = transcribe_calls(df=_stg_calls_table)
+
+    _calls_table = WeaviateImportDataOperator(task_id='generate_call_embeddings', 
+                                                           data=_stg_transcribed_calls, 
+                                                           uuid_column='UUID', 
+                                                           class_name='CustomerCall', 
+                                                           existing='skip', 
+                                                           batched_mode=True, 
+                                                           batch_size=1000)
+
+    @task.weaviate_import
+    def generate_training_embeddings(train_df:pd.DataFrame):
+
+        train_df.columns=['rEVIEW_TEXT', 'lABEL']
+        train_df['lABEL'] = train_df['lABEL'].apply(str)
+
+        #openai works best without empty lines or new lines
+        train_df = train_df.replace(r'^\s*$', np.nan, regex=True).dropna()
+        train_df['rEVIEW_TEXT'] = train_df['rEVIEW_TEXT'].apply(lambda x: x.replace("\n",""))
+        
+        train_df['UUID'] = train_df[['rEVIEW_TEXT', 'lABEL']]\
+                                .apply(lambda x: generate_uuid5(x.to_dict(), 'CommentTraining'), axis=1)
+        
+        return {'data': train_df, 
+                'uuid_column': 'UUID', 
+                'class_name': 'CommentTraining', 
+                'existing': 'skip', 
+                'batched_mode': True, 
+                'batch_size': 1000}
+
+    @task.weaviate_import()
+    def generate_twitter_embeddings(tweet_df:pd.DataFrame):
+
+        tweet_df.columns=['cUSTOMER_ID','dATE','rEVIEW_TEXT']
+        tweet_df['cUSTOMER_ID'] = tweet_df['cUSTOMER_ID'].apply(str)
+        tweet_df['dATE'] = pd.to_datetime(tweet_df['dATE']).dt.strftime("%Y-%m-%dT%H:%M:%S-00:00")
+
+        #openai embeddings works best without empty lines or new lines
+        tweet_df = tweet_df.replace(r'^\s*$', np.nan, regex=True).dropna()
+        tweet_df['rEVIEW_TEXT'] = tweet_df['rEVIEW_TEXT'].apply(lambda x: x.replace("\n",""))
+
+        tweet_df['UUID'] = tweet_df[['cUSTOMER_ID','dATE','rEVIEW_TEXT']]\
+                                .apply(lambda x: generate_uuid5(x.to_dict(), 'CustomerComment'), axis=1)
+
+        return {'data': tweet_df, 
+                'uuid_column': 'UUID', 
+                'class_name': 'CustomerComment', 
+                'existing': 'skip', 
+                'batched_mode': True, 
+                'batch_size': 1000}
+                    
+    @aql.dataframe()
+    def train_sentiment_classifier():
+        
+        assert weaviate_client.cluster.get_nodes_status()[0]['status'] == 'HEALTHY' and weaviate_client.is_live()
+
+        results = []
+        last_uuid = None
+        while True:
+            result = weaviate_client.data_object.get(class_name='CommentTraining', 
+                                                 after=last_uuid, 
+                                                 with_vector=True, 
+                                                 limit=100) or {}
+            if not result.get('objects'):
+                break
+            results.extend(result['objects'])
+            last_uuid = result['objects'][-1]['id']
+        
+        df = pd.DataFrame(results)
+
+        df = pd.concat([pd.json_normalize(df['properties']), df['vector']], axis=1)
+
+        df['lABEL'] = df['lABEL'].apply(int)
+
+        with mlflow.start_run(run_name='lgbm_sentiment') as run:
+
+            X_train, X_test, y_train, y_test = train_test_split(df['vector'], df['lABEL'], test_size=.3, random_state=1883)
+            X_train = np.array(X_train.values.tolist())
+            y_train = np.array(y_train.values.tolist())
+            X_test = np.array(X_test.values.tolist())
+            y_test = np.array(y_test.values.tolist())
+            
+            model = LGBMClassifier(random_state=42)
+            model.fit(X=X_train, y=y_train, eval_set=(X_test, y_test))
+    
+            mflow_model_info = log_model(lgb_model=model, artifact_path='sentiment_classifier')
+            model_uri = mflow_model_info.model_uri
+        
+        return model_uri
+    
+    @aql.dataframe()
+    def call_sentiment(df:pd.DataFrame, model_uri:str):
+
+        model = load_model(model_uri=model_uri)
+        
+        df['cUSTOMER_ID'] = df['cUSTOMER_ID'].apply(str)
+
+        df['vector'] = df['UUID'].apply(lambda x: weaviate_client.data_object.get(uuid=x, with_vector=True, class_name='CustomerCall')['vector'])
+        
+        df['sentiment'] = model.predict_proba(np.stack(df['vector'].values))[:,1]
+
+        df.columns = [col.lower() for col in df.columns]
+
+        return df
+    
+    @aql.dataframe()
+    def twitter_sentiment(model_uri:str):
+        
+        model = load_model(model_uri=model_uri)
+
+        results = []
+        last_uuid = None
+        while True:
+            result = weaviate_client.data_object.get(class_name='CustomerComment', 
+                                                 after=last_uuid, 
+                                                 with_vector=True, 
+                                                 limit=100) or {}
+            if not result.get('objects'):
+                break
+            results.extend(result['objects'])
+            last_uuid = result['objects'][-1]['id']
+        
+        df = pd.DataFrame(results)
+
+        df = pd.concat([pd.json_normalize(df['properties']), df['vector']], axis=1)
+                
+        df['sentiment'] = model.predict_proba(np.stack(df['vector'].values))[:,1]
+
+        df.columns = [col.lower() for col in df.columns]
 
         return df
 
-    # @task.weaviate_import()
-    # def generate_training_embeddings(df:pd.DataFrame):
-    #     import weaviate 
-    #     from weaviate.util import generate_uuid5
-    #     import numpy as np
+    @aql.dataframe()
+    def create_sentiment_table(pred_calls_df:pd.DataFrame, pred_comment_df:pd.DataFrame):
 
-    #     df['LABEL'] = df['LABEL'].apply(str)
-
-    #     #openai works best without empty lines or new lines
-    #     df = df.replace(r'^\s*$', np.nan, regex=True).dropna()
-    #     df['REVIEW_TEXT'] = df['REVIEW_TEXT'].apply(lambda x: x.replace("\n",""))
-
-    #     weaviate_client = weaviate.Client(url=weaviate_conn['url'], 
-    #                                         additional_headers=weaviate_conn['headers'])
-    #     assert weaviate_client.cluster.get_nodes_status()[0]['status'] == 'HEALTHY' and weaviate_client.is_live()
-
-    #     class_obj = {
-    #         "class": "CommentTraining",
-    #         "vectorizer": "text2vec-openai",
-    #         "properties": [
-    #             {
-    #                 "name": "rEVIEW_TEXT",
-    #                 "dataType": ["text"]
-    #             },
-    #             {
-    #                 "name": "lABEL",
-    #                 "dataType": ["string"],
-    #                 "moduleConfig": {"text2vec-openai": {"skip": True}}
-    #             }
-    #         ]
-    #     }
-    #     try:
-    #         weaviate_client.schema.create_class(class_obj)
-    #     except Exception as e:
-    #         if isinstance(e, weaviate.UnexpectedStatusCodeException) and "already used as a name for an Object class" in e.message:                                
-    #             print("schema exists.")
-    #         else:
-    #             raise e
-            
-    #     # #For openai subscription without rate limits go the fast route
-    #     # uuids=[]
-    #     # with client.batch as batch:
-    #     #     batch.batch_size=100
-    #     #     for properties in df.to_dict(orient='index').items():
-    #     #         uuid=client.batch.add_data_object(properties[1], class_obj['class'])
-    #     #         uuids.append(uuid)
-
-    #     #For openai with rate limit go the VERY slow route
-    #     #Because we restored weaviate from pre-built embeddings this shouldn't be too long.
-    #     uuids = []
-    #     for row_id, row in df.T.items():
-    #         data_object = {'rEVIEW_TEXT': row[0], 'lABEL': row[1]}
-    #         uuid = generate_uuid5(data_object, class_obj['class'])
-    #         sleep_backoff=.5
-    #         success = False
-    #         while not success:
-    #             try:
-    #                 if weaviate_client.data_object.exists(uuid=uuid, class_name=class_obj['class']):
-    #                     print(f'UUID {uuid} exists.  Skipping.')
-    #                 else:
-    #                     uuid = weaviate_client.data_object.create(
-    #                         data_object=data_object, 
-    #                         uuid=uuid, 
-    #                         class_name=class_obj['class'])
-    #                     print(f'Added row {row_id} with uuid {uuid}, sleeping for {sleep_backoff} seconds.')
-    #                     sleep(sleep_backoff)
-    #                 success=True
-    #                 uuids.append(uuid)
-    #             except Exception as e:
-    #                 if isinstance(e, weaviate.UnexpectedStatusCodeException) and "Rate limit reached" in e.message:                                
-    #                     sleep_backoff+=1
-    #                     print(f'Rate limit reached. Sleeping {sleep_backoff} seconds.')
-    #                     sleep(sleep_backoff)
-    #                 else:
-    #                     raise(e)
+        sentiment_df = pred_calls_df.groupby('customer_id').agg(calls_sentiment=pd.NamedAgg(column='sentiment', aggfunc='mean'))\
+                            .join(pred_comment_df.groupby('customer_id').agg(comments_sentiment=pd.NamedAgg(column='sentiment', aggfunc='mean')), how='right')\
+                            .fillna(0)\
+                            .eval('sentiment_score = (calls_sentiment + comments_sentiment)/2')
         
-    #     df['UUID']=uuids
+        sentiment_df['sentiment_bucket']=pd.qcut(sentiment_df['sentiment_score'], q=10, precision=4, labels=False, duplicates='drop')
+        sentiment_df.reset_index(inplace=True)
 
-    #     return df
-
-    # @aql.dataframe()
-    # def generate_twitter_embeddings(df:pd.DataFrame):
-    #     import weaviate 
-    #     from weaviate.util import generate_uuid5
-    #     import numpy as np
-
-    #     df.columns=['CUSTOMER_ID','DATE','REVIEW_TEXT']
-    #     df['CUSTOMER_ID'] = df['CUSTOMER_ID'].apply(str)
-    #     df['DATE'] = pd.to_datetime(df['DATE']).dt.strftime("%Y-%m-%dT%H:%M:%S-00:00")
-
-    #     #openai embeddings works best without empty lines or new lines
-    #     df = df.replace(r'^\s*$', np.nan, regex=True).dropna()
-    #     df['REVIEW_TEXT'] = df['REVIEW_TEXT'].apply(lambda x: x.replace("\n",""))
-        
-    #     weaviate_client = weaviate.Client(url=weaviate_conn['url'], 
-    #                                         additional_headers=weaviate_conn['headers'])
-    #     assert weaviate_client.cluster.get_nodes_status()[0]['status'] == 'HEALTHY' and weaviate_client.is_live()
-
-    #     class_obj = {
-    #         "class": "CustomerComment",
-    #         "vectorizer": "text2vec-openai",
-    #         "properties": [
-    #             {
-    #             "name": "CUSTOMER_ID",
-    #             "dataType": ["string"],
-    #             "moduleConfig": {"text2vec-openai": {"skip": True}}
-    #             },
-    #             {
-    #             "name": "DATE",
-    #             "dataType": ["date"],
-    #             "moduleConfig": {"text2vec-openai": {"skip": True}}
-    #             },
-    #             {
-    #             "name": "REVIEW_TEXT",
-    #             "dataType": ["text"]
-    #             }
-    #         ]
-    #     }
-                    
-    #     try:
-    #         weaviate_client.schema.create_class(class_obj)
-    #     except Exception as e:
-    #         if isinstance(e, weaviate.UnexpectedStatusCodeException) and \
-    #                 "already used as a name for an Object class" in e.message:                                
-    #             print("schema exists.")
-    #         else:
-    #             raise e
-                        
-    #     # #For openai subscription without rate limits go the fast route
-    #     # uuids=[]
-    #     # with client.batch as batch:
-    #     #     batch.batch_size=100
-    #     #     for properties in df.to_dict(orient='index').items():
-    #     #         uuid=client.batch.add_data_object(properties[1], class_obj['class'])
-    #     #         uuids.append(uuid)
-
-    #     #For openai with rate limit go the VERY slow route
-    #     #Because we restored weaviate from pre-built embeddings this shouldn't be too long.
-    #     uuids = []
-    #     for row_id, row in df.T.items():
-    #         data_object = {'cUSTOMER_ID': row[0], 'dATE': row[1], 'rEVIEW_TEXT': row[2]}
-    #         uuid = generate_uuid5(data_object, class_obj['class'])
-    #         sleep_backoff=.5
-    #         success = False
-    #         while not success:
-    #             try:
-    #                 if weaviate_client.data_object.exists(uuid=uuid, class_name=class_obj['class']):
-    #                     print(f'UUID {uuid} exists.  Skipping.')
-    #                 else:
-    #                     uuid = weaviate_client.data_object.create(
-    #                                 data_object=data_object, 
-    #                                 uuid=uuid, 
-    #                                 class_name=class_obj['class']
-    #                             )
-                                    
-    #                     print(f'Added row {row_id} with uuid {uuid}, sleeping for {sleep_backoff} seconds.')
-    #                     sleep(sleep_backoff)
-    #                 success=True
-    #                 uuids.append(uuid)
-    #             except Exception as e:
-    #                 if isinstance(e, weaviate.UnexpectedStatusCodeException) and "Rate limit reached" in e.message:                                
-    #                     sleep_backoff+=1
-    #                     print(f'Rate limit reached. Sleeping {sleep_backoff} seconds.')
-    #                     sleep(sleep_backoff)
-    #                 else:
-    #                     raise(e)
-
-    #     df['UUID']=uuids
-    #     df['DATE'] = pd.to_datetime(df['DATE'])
-
-    #     return df
+        return sentiment_df
     
-    # @task.weaviate_import()
-    # def generate_call_embeddings(df:pd.DataFrame):
-    #     import weaviate 
-    #     from weaviate.util import generate_uuid5
-    #     import numpy as np
+    @aql.dataframe()
+    def create_ad_spend_table(attribution_touches_df:pd.DataFrame):
 
-    #     df['CUSTOMER_ID'] = df['CUSTOMER_ID'].apply(str)
-
-    #     #openai embeddings works best without empty lines or new lines
-    #     df = df.replace(r'^\s*$', np.nan, regex=True).dropna()
-    #     df['TRANSCRIPT'] = df['TRANSCRIPT'].apply(lambda x: x.replace("\n",""))
-
-    #     weaviate_client = weaviate.Client(url=weaviate_conn['url'], 
-    #                                         additional_headers=weaviate_conn['headers'])
-    #     assert weaviate_client.cluster.get_nodes_status()[0]['status'] == 'HEALTHY' and weaviate_client.is_live()
-
-    #     class_obj = {
-    #         "class": "CustomerCall",
-    #         "vectorizer": "text2vec-openai",
-    #         "properties": [
-    #             {
-    #             "name": "CUSTOMER_ID",
-    #             "dataType": ["string"],
-    #             "moduleConfig": {"text2vec-openai": {"skip": True}}
-    #             },
-    #             {
-    #             "name": "RELATIVE_PATH",
-    #             "dataType": ["string"],
-    #             "moduleConfig": {"text2vec-openai": {"skip": True}}
-    #             },
-    #             {
-    #             "name": "TRANSCRIPT",
-    #             "dataType": ["text"]
-    #             }
-    #         ]
-    #     }
-        
-    #     try:
-    #         weaviate_client.schema.create_class(class_obj)
-    #     except Exception as e:
-    #         if isinstance(e, weaviate.UnexpectedStatusCodeException) and \
-    #                 "already used as a name for an Object class" in e.message:                                
-    #             print("schema exists.")
-            
-    #     # #For openai subscription without rate limits go the fast route
-    #     # uuids=[]
-    #     # with client.batch as batch:
-    #     #     batch.batch_size=100
-    #     #     for properties in df.to_dict(orient='index').items():
-    #     #         uuid=client.batch.add_data_object(properties[1], class_obj['class'])
-    #     #         uuids.append(uuid)
-
-    #     #For openai with rate limit go the VERY slow route
-    #     #Because we restored weaviate from pre-built embeddings this shouldn't be too long.
-    #     uuids = []
-    #     for row_id, row in df.T.items():
-    #         data_object = {'cUSTOMER_ID': row[0], 'rELATIVE_PATH': row[1], 'tRANSCRIPT': row[2]}
-    #         uuid = generate_uuid5(data_object, class_obj['class'])
-    #         sleep_backoff=.5
-    #         success = False
-    #         while not success:
-    #             try:
-    #                 if weaviate_client.data_object.exists(uuid=uuid, class_name=class_obj['class']):
-    #                     print(f'UUID {uuid} exists.  Skipping.')
-    #                 else:
-    #                     uuid = weaviate_client.data_object.create(
-    #                                 data_object=data_object, 
-    #                                 uuid=uuid, 
-    #                                 class_name=class_obj['class']
-    #                             )   
-    #                     print(f'Added row {row_id} with uuid {uuid}, sleeping for {sleep_backoff} seconds.')
-    #                     sleep(sleep_backoff)
-    #                 success=True
-    #                 uuids.append(uuid)
-    #             except Exception as e:
-    #                 if isinstance(e, weaviate.UnexpectedStatusCodeException) and "Rate limit reached" in e.message:                                
-    #                     sleep_backoff+=1
-    #                     print(f'Rate limit reached. Sleeping {sleep_backoff} seconds.')
-    #                     sleep(sleep_backoff)
-    #                 else:
-    #                     raise(e)
-        
-    #     df['UUID']=uuids
-        
-    #     return df
-                    
-    # @aql.dataframe()
-    # def train_sentiment_classifier(df:pd.DataFrame, weaviate_conn:dict):
-    #     from sklearn.model_selection import train_test_split 
-    #     from mlflow.tensorflow import log_model
-    #     import mlflow
-    #     import numpy as np
-    #     from tensorflow.keras.models import Sequential
-    #     from tensorflow.keras import layers
-    #     import weaviate 
-
-    #     weaviate_client = weaviate.Client(url=weaviate_conn['url'], 
-    #                                       additional_headers=weaviate_conn['headers'])
-    #     assert weaviate_client.cluster.get_nodes_status()[0]['status'] == 'HEALTHY' and weaviate_client.is_live()
-
-    #     df['LABEL'] = df['LABEL'].apply(int)
-    #     df['VECTOR'] = df.apply(lambda x: weaviate_client.data_object.get(class_name='CommentTraining', 
-    #                                                                       uuid=x.UUID, with_vector=True)['vector'], 
-    #                                                                       axis=1)
-
-    #     with mlflow.start_run(run_name='tf_sentiment') as run:
-
-    #         X_train, X_test, y_train, y_test = train_test_split(df['VECTOR'], df['LABEL'], test_size=.3, random_state=1883)
-    #         X_train = np.array(X_train.values.tolist())
-    #         y_train = np.array(y_train.values.tolist())
-    #         X_test = np.array(X_test.values.tolist())
-    #         y_test = np.array(y_test.values.tolist())
-        
-    #         model = Sequential()
-    #         model.add(layers.Dense(1, activation='sigmoid'))
-    #         model.compile(optimizer='rmsprop',loss='binary_crossentropy', metrics=['accuracy'])
-    #         model.fit(X_train, y_train, epochs=70, validation_data=(X_test, y_test))
+        ad_spend_df = attribution_touches_df[['utm_medium', 'revenue']].dropna().groupby('utm_medium').sum('revenue')
+        ad_spend_df.reset_index(inplace=True)
+        ad_spend_df.columns=['Medium','Revenue']
     
-    #         mflow_model_info = log_model(model=model, artifact_path='sentiment_classifier')
-    #         model_uri = mflow_model_info.model_uri
+        return ad_spend_df
+
+    @aql.dataframe()
+    def create_clv_table(customers_df:pd.DataFrame, sentiment_df:pd.DataFrame):
         
-    #     return model_uri
+        customers_df = customers_df.dropna(subset=['customer_lifetime_value'])
+        customers_df['customer_id'] = customers_df['customer_id'].apply(str)
+        customers_df['name'] = customers_df[['first_name', 'last_name']].agg(' '.join, axis=1)
+        customers_df['clv'] = customers_df['customer_lifetime_value'].round(2)
+
+        clv_df = customers_df.set_index('customer_id').join(sentiment_df.set_index('customer_id')).reset_index()
     
-    # #score_sentiment
-    # @aql.dataframe()
-    # def call_sentiment(df:pd.DataFrame, model_uri:str, weaviate_conn:dict):
-    #     import weaviate
-    #     from mlflow.tensorflow import load_model
-    #     import numpy as np
-
-    #     model = load_model(model_uri=model_uri)
-
-    #     weaviate_client = weaviate.Client(url=weaviate_conn['url'], 
-    #                                       additional_headers=weaviate_conn['headers'])
-        
-    #     df['VECTOR'] = df.apply(lambda x: weaviate_client.data_object.get(class_name='CustomerCall', 
-    #                                                                         uuid=x.UUID, with_vector=True)['vector'], 
-    #                                                                         axis=1)
-        
-    #     df['SENTIMENT'] = model.predict(np.stack(df['VECTOR'].values))
-
-    #     df.columns = [col.lower() for col in df.columns]
-
-    #     return df
+        return clv_df[['customer_id', 'name', 'first_order', 'most_recent_order', 'number_of_orders', 'clv', 'sentiment_score']]
     
-    # @aql.dataframe()
-    # def twitter_sentiment(df:pd.DataFrame, model_uri:str, weaviate_conn:dict):
-    #     import weaviate
-    #     from mlflow.tensorflow import load_model
-    #     import numpy as np
-
-    #     model = load_model(model_uri=model_uri)
-
-    #     weaviate_client = weaviate.Client(url=weaviate_conn['url'], 
-    #                                       additional_headers=weaviate_conn['headers'])
+    @aql.dataframe()
+    def create_churn_table(customers_df:pd.DataFrame, sentiment_df:pd.DataFrame, rev_df:pd.DataFrame):
         
-    #     df['VECTOR'] = df.apply(lambda x: weaviate_client.data_object.get(class_name='CustomerComment', 
-    #                                                                         uuid=x.UUID, with_vector=True)['vector'], 
-    #                                                                         axis=1)
-        
-    #     df['SENTIMENT'] = model.predict(np.stack(df['VECTOR'].values))
+        customers_df['customer_id'] = customers_df['customer_id'].apply(str)
+        customers_df['name'] = customers_df[['first_name', 'last_name']].agg(' '.join, axis=1)
+        customers_df['clv'] = customers_df['customer_lifetime_value'].round(2)
+        customers_df = customers_df.dropna(subset=['customer_lifetime_value'])[['customer_id', 'name', 'clv']].set_index('customer_id')
 
-    #     df.columns = [col.lower() for col in df.columns]
+        rev_df['customer_id'] = rev_df['customer_id'].apply(str)
+        rev_df = rev_df[['customer_id', 'first_active_month', 'last_active_month', 'change_category']].set_index('customer_id')
 
-    #     return df
+        sentiment_df = sentiment_df[['customer_id', 'sentiment_score']].set_index('customer_id')
 
-    # @aql.dataframe()
-    # def create_sentiment_table(pred_calls_df:pd.DataFrame, pred_comment_df:pd.DataFrame):
-
-    #     sentiment_df = pred_calls_df.groupby('customer_id').agg(calls_sentiment=pd.NamedAgg(column='sentiment', aggfunc='mean'))\
-    #                         .join(pred_comment_df.groupby('customer_id').agg(comments_sentiment=pd.NamedAgg(column='sentiment', aggfunc='mean')), 
-    #                             how='right')\
-    #                         .fillna(0)\
-    #                         .eval('sentiment_score = (calls_sentiment + comments_sentiment)/2')
-        
-    #     sentiment_df['sentiment_bucket']=pd.qcut(sentiment_df['sentiment_score'], q=10, precision=4, labels=False)
-    #     sentiment_df.reset_index(inplace=True)
-
-    #     return sentiment_df
-    
-    # @aql.dataframe()
-    # def create_ad_spend_table(ad_spend_df:pd.DataFrame):
-
-    #     ad_spend_df = ad_spend_df[['utm_medium', 'revenue']].dropna().groupby('utm_medium').sum('revenue')
-    #     ad_spend_df.reset_index(inplace=True)
-    #     ad_spend_df.columns=['Medium','Revenue']
-    
-    #     return ad_spend_df
-
-    # @aql.dataframe()
-    # def create_clv_table(customers_df:pd.DataFrame, sentiment_df:pd.DataFrame):
-        
-    #     customers_df = customers_df.dropna(subset=['customer_lifetime_value'])
-    #     customers_df['customer_id'] = customers_df['customer_id'].apply(str)
-    #     customers_df['name'] = customers_df[['first_name', 'last_name']].agg(' '.join, axis=1)
-    #     customers_df['clv'] = customers_df['customer_lifetime_value'].round(2)
-
-    #     clv_df = customers_df.set_index('customer_id').join(sentiment_df.set_index('customer_id')).reset_index()
-    
-    #     return clv_df[['customer_id', 'name', 'first_order', 'most_recent_order', 'number_of_orders', 'clv', 'sentiment_score']]
-    
-    # @aql.dataframe()
-    # def create_churn_table(customers_df:pd.DataFrame, sentiment_df:pd.DataFrame, rev_df:pd.DataFrame):
-        
-    #     customers_df['customer_id'] = customers_df['customer_id'].apply(str)
-    #     customers_df['name'] = customers_df[['first_name', 'last_name']].agg(' '.join, axis=1)
-    #     customers_df['clv'] = customers_df['customer_lifetime_value'].round(2)
-    #     customers_df = customers_df.dropna(subset=['customer_lifetime_value'])[['customer_id', 'name', 'clv']].set_index('customer_id')
-    #     rev_df['customer_id'] = rev_df['customer_id'].apply(str)
-    #     rev_df = rev_df[['customer_id', 'last_active_month', 'change_category']].set_index('customer_id')
-    #     sentiment_df = sentiment_df[['customer_id', 'sentiment_score']].set_index('customer_id')
-
-    #     churn_df = customers_df.join(rev_df, how='right')\
-    #                             .join(sentiment_df, how='left')\
-    #                             .dropna(subset=['clv'])
+        churn_df = customers_df.join(rev_df, how='right')\
+                                .join(sentiment_df, how='left')\
+                                .dropna(subset=['clv'])
                                 
-    #     churn_df = churn_df[churn_df['change_category'] == 'churn']
+        churn_df = churn_df[churn_df['change_category'] == 'churn']
+        churn_df.reset_index(inplace=True)
+        churn_df.drop_duplicates(inplace=True)
         
-    #     return churn_df.reset_index()
-
-    # _pg_schema = drop_schema() 
-
-    _bucket_names = create_buckets(replace_existing=True) 
-
-    _download_weaviate_backup = download_weaviate_backup()
+        return churn_df
     
-    _stg_calls_table = extract_customer_support_calls(bucket_names=_bucket_names,
-                                                      replace=False,
-                                                      output_table=Table(name='stg_customer_calls', 
-                                                                            metadata=Metadata(schema=pg_schema), 
-                                                                            conn_id=_POSTGRES_CONN_ID))
+    _training_table = generate_training_embeddings(train_df=_stg_training_table)
 
-    _stg_calls_table = transcribe_calls(df=_stg_calls_table,
-                                        output_table=Table(name='stg_customer_calls', 
-                                                            metadata=Metadata(schema=pg_schema), 
-                                                            conn_id=_POSTGRES_CONN_ID))
+    _comment_table = generate_twitter_embeddings(tweet_df=_stg_comment_table)
+
+    _model_uri = train_sentiment_classifier()
+
+    _pred_calls_table = call_sentiment(df=_stg_transcribed_calls,
+                                       model_uri=_model_uri,
+                                       output_table=Table(name='pred_customer_calls', 
+                                                               metadata=Metadata(schema=pg_schema), 
+                                                               conn_id=_POSTGRES_CONN_ID))
     
-    # _training_table = generate_training_embeddings(df=_stg_training_table, 
-    #                                                output_table=Table(name='training_table', 
-    #                                                                   metadata=Metadata(schema=pg_schema), 
-    #                                                                   conn_id=_POSTGRES_CONN_ID))
-    # _comment_table = generate_twitter_embeddings(df=_stg_comment_table, 
-    #                                              output_table=Table(name='comment_table', 
-    #                                                                 metadata=Metadata(schema=pg_schema), 
-    #                                                                 conn_id=_POSTGRES_CONN_ID))
-    # _calls_table = generate_call_embeddings(df=_stg_calls_table,
-    #                                         output_table=Table(name='calls_table', 
-    #                                                            metadata=Metadata(schema=pg_schema), 
-    #                                                            conn_id=_POSTGRES_CONN_ID))
-
-    # _model_uri = train_sentiment_classifier(df=_training_table, weaviate_conn=_weaviate_conn)
-
-    # _pred_calls_table = call_sentiment(df=_calls_table,
-    #                                    model_uri=_model_uri,
-    #                                    weaviate_conn=_weaviate_conn,
-    #                                    output_table=Table(name='pred_customer_calls', 
-    #                                                            metadata=Metadata(schema=pg_schema), 
-    #                                                            conn_id=_POSTGRES_CONN_ID))
-    
-    # _pred_comment_table = twitter_sentiment(df=_comment_table,
-    #                                         model_uri=_model_uri,
-    #                                         weaviate_conn=_weaviate_conn,
-    #                                         output_table=Table(name='pred_twitter_comments', 
-    #                                                            metadata=Metadata(schema=pg_schema), 
-    #                                                            conn_id=_POSTGRES_CONN_ID))
+    _pred_comment_table = twitter_sentiment(model_uri=_model_uri,
+                                            output_table=Table(name='pred_twitter_comments', 
+                                                               metadata=Metadata(schema=pg_schema), 
+                                                               conn_id=_POSTGRES_CONN_ID))
 
     
-    # _sentiment_table = create_sentiment_table(pred_calls_df=_pred_calls_table,
-    #                                           pred_comment_df=_pred_comment_table,
-    #                                           output_table=Table(name='pres_sentiment', metadata=Metadata(schema=pg_schema), conn_id=_POSTGRES_CONN_ID))
+    _sentiment_table = create_sentiment_table(pred_calls_df=_pred_calls_table,
+                                              pred_comment_df=_pred_comment_table,
+                                              output_table=Table(name='pres_sentiment', 
+                                                                 metadata=Metadata(schema=pg_schema), 
+                                                                 conn_id=_POSTGRES_CONN_ID))
     
-    # _ad_spend_table = create_ad_spend_table(ad_spend_df=Table(name='attribution_touches', metadata=Metadata(schema=pg_schema), conn_id=_POSTGRES_CONN_ID),
-    #                                         output_table=Table(name='pres_ad_spend', metadata=Metadata(schema=pg_schema), conn_id=_POSTGRES_CONN_ID))
+    _ad_spend_table = create_ad_spend_table(attribution_touches_df=_attribution_touches,
+                                            output_table=Table(name='pres_ad_spend', 
+                                                               metadata=Metadata(schema=pg_schema), 
+                                                               conn_id=_POSTGRES_CONN_ID))
     
-    # create_clv_table(customers_df=Table(name='customers', metadata=Metadata(schema=pg_schema), conn_id=_POSTGRES_CONN_ID),
-    #                  sentiment_df=_sentiment_table,
-    #                  output_table=Table(name='pres_clv', metadata=Metadata(schema=pg_schema), conn_id=_POSTGRES_CONN_ID))
+    create_clv_table(sentiment_df=_sentiment_table,
+                     customers_df=_customers,
+                     output_table=Table(name='pres_clv', 
+                                        metadata=Metadata(schema=pg_schema), 
+                                        conn_id=_POSTGRES_CONN_ID))
     
-    # create_churn_table(customers_df=Table(name='customers', metadata=Metadata(schema=pg_schema), conn_id=_POSTGRES_CONN_ID),
-    #                  sentiment_df=_sentiment_table,
-    #                  rev_df=Table(name='mrr', metadata=Metadata(schema=pg_schema), conn_id=_POSTGRES_CONN_ID),
-    #                  output_table=Table(name='pres_churn', metadata=Metadata(schema=pg_schema), conn_id=_POSTGRES_CONN_ID))
+    create_churn_table(sentiment_df=_sentiment_table,
+                       customers_df=_customers,
+                       rev_df=_mrr,
+                       output_table=Table(name='pres_churn', 
+                                          metadata=Metadata(schema=pg_schema), 
+                                          conn_id=_POSTGRES_CONN_ID))
     
-    # _pg_schema >> \
-    load_structured_data()  #>> \
-            # transform_structured() >> \
-                # _ad_spend_table
+    _load_structured_data >> [_customers, _mrr, _attribution_touches]
+
+    [_stg_calls_table, _stg_comment_table, _stg_training_table]
     
-    _download_weaviate_backup >> _restore_weaviate >> [_stg_calls_table, _stg_comment_table, _stg_training_table]
-    #  [_training_table, _comment_table, _calls_table]
+    _download_weaviate_backup >> _restore_weaviate >> _check_schema 
+    _create_schema >> _restore_weaviate
+    _check_schema >> [_alert_schema, _training_table, _comment_table, _calls_table]
+    _calls_table >> _pred_calls_table
+    _comment_table >> _pred_comment_table
+    _training_table >> _model_uri
 
 customer_analytics()
 
 def test():
+    from airflow.providers.postgres.hooks.postgres import PostgresHook
     hook=PostgresHook(_POSTGRES_CONN_ID)
-    
-    pred_comment_df=hook.get_pandas_df(f'SELECT * FROM pred_twitter_comments;')
-    pred_calls_df=hook.get_pandas_df(f'SELECT * FROM pred_customer_calls;')
-
     customers_df = hook.get_pandas_df(f'SELECT * FROM demo.stg_customers;')
     orders_df = hook.get_pandas_df(f'SELECT * FROM demo.stg_orders;')
     payments_df = hook.get_pandas_df(f'SELECT * FROM demo.stg_payments;')
+    subscription_periods = hook.get_pandas_df(f'SELECT * FROM demo.stg_subscription_periods;')
+    customer_conversions_df = hook.get_pandas_df(f'SELECT * FROM demo.stg_customer_conversions;')
+    sessions_df = hook.get_pandas_df(f'SELECT * FROM demo.stg_sessions;')
+    train_df = hook.get_pandas_df(f'SELECT * FROM demo.stg_comment_training;')
+
+    pred_comment_df=hook.get_pandas_df(f'SELECT * FROM demo.pred_twitter_comments;')
+    pred_calls_df=hook.get_pandas_df(f'SELECT * FROM demo.pred_customer_calls;')
+
+    calls_df = hook.get_pandas_df(f'SELECT * FROM demo.stg_customer_calls;')
     
-    ad_spend_df = hook.get_pandas_df(f'SELECT * FROM attribution_touches;')
-    rev_df = hook.get_pandas_df(f'SELECT * FROM mrr;')
+    customers_df = hook.get_pandas_df(f'SELECT * FROM demo.customers;')
+    sentiment_df = hook.get_pandas_df(f'SELECT * FROM demo.pres_sentiment;')
+    rev_df = hook.get_pandas_df(f'SELECT * FROM demo.mrr;')
+    attribution_touches_df = hook.get_pandas_df(f'SELECT * FROM demo.attribution_touches;')
+    pres_ad_spend = hook.get_pandas_df(f'SELECT * FROM demo.pres_ad_spend;')
+    clv = hook.get_pandas_df(f'SELECT * FROM demo.pres_clv;')
+    churn = hook.get_pandas_df(f'SELECT * FROM demo.pres_churn;')
+    
+
+    WeaviateHook(_WEAVIATE_CONN_ID).get_conn().schema.delete_all()
+    WeaviateCreateSchemaOperator(task_id='test', class_object_data='file://include/weaviate_schema.json', existing='replace').execute({})
+    WeaviateCheckSchemaOperator(task_id='test', class_object_data='file://include/weaviate_schema.json').execute({})
+

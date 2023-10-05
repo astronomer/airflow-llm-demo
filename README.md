@@ -65,10 +65,9 @@ git clone https://github.com/astronomer/airflow-llm-demo
 cd airflow-llm-demo
 ```
 
-3. Export your OpenAI API key as an environment variable.
-```bash
-export OPENAI_APIKEY='<OPENAI_APIKEY>'
-```
+3. The data for this demo has been pre-embedded so the DAG will run without requiring an OpenAI token.  However, the Streamlit app uses the Weaviate [Q&A](https://weaviate.io/developers/weaviate/modules/reader-generator-modules/qna-openai) and [near text](https://weaviate.io/developers/weaviate/search/similarity) modules and an OpenAI key is required to generate embeddings for the users question or search term.
+
+If you would like to run the Streamlit application you will need to add you OpenAI API key to the `AIRFLOW_CONN_WEAVIATE_DEFAULT` variable in the `.env` file.  
   
 4.  Start Airflow, Minio, Weaviate, Streamlit and MLflow.
 ```bash
@@ -82,7 +81,22 @@ astro dev run dags trigger customer_analytics
 ```
 Follow the status of the DAG run in the [Airflow UI](http://localhost:8080/dags/customer_analytics/grid) (username: admin, password: admin)
       
-5. Open the streamlit application [http://localhost:8501](http://localhost:8501)
+5. After the DAG completes look at the customer analytics dashboard in Streamlit.   
+Streamlit has been installed alongside the Airflow UI in the webserver container. 
+
+Connect to the webserver container with the Astro CLI
+```bash
+astro dev bash -w
+``` 
+
+Start Streamlit
+```bash
+cd include/streamlit/src
+python -m streamlit run ./streamlit_app.py
+```
+
+Open the [streamlit application](http://localhost:8501) in a browser.
+
 Other service UIs are available at the the following:
 - Airflow: [http://localhost:8080](http://localhost:8080) Username:Password is admin:admin
 - Minio: [http://localhost:9000](http://localhost:9000) Username:Password is minioadmin:minioadmin

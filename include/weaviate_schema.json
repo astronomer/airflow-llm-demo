@@ -10,8 +10,7 @@
                 },
                 {
                     "name": "lABEL",
-                    "dataType": ["string"],
-                    "moduleConfig": {"text2vec-openai": {"skip": "True"}}
+                    "dataType": ["text"]
                 }
             ]
         },
@@ -20,17 +19,15 @@
             "vectorizer": "text2vec-openai",
             "properties": [
                 {
-                "name": "CUSTOMER_ID",
-                "dataType": ["string"],
-                "moduleConfig": {"text2vec-openai": {"skip": "True"}}
+                "name": "cUSTOMER_ID",
+                "dataType": ["text"]
                 },
                 {
-                "name": "DATE",
-                "dataType": ["date"],
-                "moduleConfig": {"text2vec-openai": {"skip": "True"}}
+                "name": "dATE",
+                "dataType": ["date"]
                 },
                 {
-                "name": "REVIEW_TEXT",
+                "name": "rEVIEW_TEXT",
                 "dataType": ["text"]
                 }
             ]
@@ -40,17 +37,15 @@
             "vectorizer": "text2vec-openai",
             "properties": [
                 {
-                "name": "CUSTOMER_ID",
-                "dataType": ["string"],
-                "moduleConfig": {"text2vec-openai": {"skip": "True"}}
+                "name": "cUSTOMER_ID",
+                "dataType": ["text"]
                 },
                 {
-                "name": "RELATIVE_PATH",
-                "dataType": ["string"],
-                "moduleConfig": {"text2vec-openai": {"skip": "True"}}
+                "name": "rELATIVE_PATH",
+                "dataType": ["text"]
                 },
                 {
-                "name": "TRANSCRIPT",
+                "name": "tRANSCRIPT",
                 "dataType": ["text"]
                 }
             ]
