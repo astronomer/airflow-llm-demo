@@ -158,17 +158,16 @@ def customer_analytics():
                                     .merge(customer_payments_df, how='left', on='customer_id')
             customers.rename({'amount': 'customer_lifetime_value'}, axis=1, inplace=True)
             
-            # payment_types = ['credit_card', 'coupon', 'bank_transfer', 'gift_card']
-            
-            # orders = payments_df.drop('payment_id', axis=1)\
-            #                     .pivot_table(index='payment_method', values=payment_types )\
-            #                     .agg(F.sum('amount'))\
-            #                     .group_by('order_id')\
-            #                     .agg({f"'{x}'": "sum" for x in payment_types})\
-            #                     .rename({f"SUM('{x.upper()}')": x+'_amount' for x in payment_types})\
-            #                     .join(payments_df.group_by('order_id')\
-            #                                         .agg(F.sum('amount').alias('total_amount')), on='order_id')\
-            #                     .join(orders_df, on='order_id')
+            orders = payments_df.drop('payment_id', axis=1)\
+                                .pivot_table(columns='payment_method', 
+                                            index='order_id', 
+                                            values='amount', 
+                                            aggfunc='sum').reset_index()
+
+            orders = orders.merge(payments_df.groupby('order_id')\
+                                            .sum('amount'), on='order_id')
+            orders = orders.merge(orders_df, on='order_id')
+            orders.rename({'amount': 'total_amount'}, inplace=True)
 
             return customers
         
